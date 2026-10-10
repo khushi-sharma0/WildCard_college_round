@@ -7,14 +7,14 @@ export const maxDuration = 60;
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { prompt, workspaceId } = body;
+    const { prompt, workspaceId, history } = body;
 
     if (!prompt || typeof prompt !== "string") {
       return NextResponse.json({ error: "Prompt string is required" }, { status: 400 });
     }
 
     const role = await getRole();
-    const initialSnapshot = await startRun(prompt, role, workspaceId);
+    const initialSnapshot = await startRun(prompt, role, workspaceId, Array.isArray(history) ? history : []);
 
     return NextResponse.json(initialSnapshot);
   } catch (error: any) {

@@ -7,6 +7,13 @@ import {
   draftCampaign,
   sendCampaign,
   queryAnalytics,
+  listContacts,
+  listWebinars,
+  listCampaigns,
+  listSegments,
+  listPlans,
+  listSubscriptions,
+  listAuditLogs,
   WS
 } from "../services";
 import { UserRole } from "../auth";
@@ -45,6 +52,51 @@ export const tools: Record<string, AgentTool> = {
     }
   },
 
+  get_crm_summary: {
+    name: "get_crm_summary",
+    description: "Retrieve comprehensive CRM contact metrics: total contacts, lead counts, status breakdowns (lead, qualified, customer, lost), tag distributions (retail, saas, edu), and sample leads.",
+    riskTier: "low",
+    allowedRoles: ["admin", "marketer", "viewer"],
+    schema: z.object({
+      tag: z.string().optional().describe("Optional filter tag e.g. 'retail', 'saas', 'edu'"),
+      search: z.string().optional().describe("Optional keyword search")
+    }),
+    execute: async (args, context) => {
+      const contacts = await listContacts(context.workspaceId || WS, args.search, args.tag);
+      const total = contacts.length;
+      const byStatus = {
+        lead: contacts.filter((c) => c.status === "lead").length,
+        qualified: contacts.filter((c) => c.status === "qualified").length,
+        customer: contacts.filter((c) => c.status === "customer").length,
+        lost: contacts.filter((c) => c.status === "lost").length
+      };
+
+      const byTag: Record<string, number> = {};
+      for (const c of contacts) {
+        if (c.tags) {
+          for (const t of c.tags) {
+            byTag[t] = (byTag[t] || 0) + 1;
+          }
+        }
+      }
+
+      const conversionRate = total > 0 ? Number(((byStatus.customer / total) * 100).toFixed(1)) : 0;
+
+      return {
+        total_contacts: total,
+        by_status: byStatus,
+        by_tag: byTag,
+        conversion_rate_percent: conversionRate,
+        sample_contacts: contacts.slice(0, 8).map((c) => ({
+          name: c.name,
+          email: c.email,
+          tags: c.tags,
+          status: c.status
+        }))
+      };
+    }
+  },
+
   query_analytics: {
     name: "query_analytics",
     description: "Fetch real-time analytics KPIs, conversion funnel, campaign performance, and recent activity metrics.",
@@ -56,6 +108,118 @@ export const tools: Record<string, AgentTool> = {
     execute: async (_args, context) => {
       const data = await queryAnalytics(context.workspaceId || WS);
       return data;
+    }
+  },
+
+  get_audit_summary: {
+    name: "get_audit_summary",
+    description: "Retrieve comprehensive audit logs, governance events, risk levels, and execution statuses across the platform.",
+    riskTier: "low",
+    allowedRoles: ["admin", "marketer", "viewer"],
+    schema: z.object({
+      limit: z.number().optional().describe("Maximum number of recent audit logs to retrieve")
+    }),
+    execute: async (args, context) => {
+      const logs = await listAuditLogs(context.workspaceId || WS);
+      const total = logs.length;
+      const byRisk = {
+        low: logs.filter((l) => l.risk === "low").length,
+        medium: logs.filter((l) => l.risk === "medium").length,
+        high: logs.filter((l) => l.risk === "high").length
+      };
+      const byStatus = {
+        executed: logs.filter((l) => l.status === "executed").length,
+        pending_approval: logs.filter((l) => l.status === "pending_approval").length,
+        blocked: logs.filter((l) => l.status === "blocked").length,
+        rejected: logs.filter((l) => l.status === "rejected").length,
+        error: logs.filter((l) => l.status === "error").length
+      };
+      return {
+        total_logs: total,
+        by_risk: byRisk,
+        by_status: byStatus,
+        recent_logs: logs.slice(0, args.limit || 8).map((l) => ({
+          id: l.id,
+          tool: l.tool,
+          role: l.role,
+          risk: l.risk,
+          status: l.status,
+          created_at: l.created_at
+        }))
+      };
+    }
+  },
+
+  list_webinars_data: {
+    name: "list_webinars_data",
+    description: "Retrieve current webinars, scheduled dates, Jitsi room identifiers, and attendee registration counts.",
+    riskTier: "low",
+    allowedRoles: ["admin", "marketer", "viewer"],
+    schema: z.object({}),
+    execute: async (_args, context) => {
+      const list = await listWebinars(context.workspaceId || WS);
+      return {
+        total_webinars: list.length,
+        webinars: list.map((w) => ({
+          id: w.id,
+          title: w.title,
+          scheduled_at: w.scheduled_at,
+          jitsi_room: w.jitsi_room,
+          registrations_count: w.registrations_count || 0
+        }))
+      };
+    }
+  },
+
+  list_marketing_data: {
+    name: "list_marketing_data",
+    description: "Retrieve current marketing email campaigns, drafts, delivery statistics, and target segments.",
+    riskTier: "low",
+    allowedRoles: ["admin", "marketer", "viewer"],
+    schema: z.object({}),
+    execute: async (_args, context) => {
+      const camps = await listCampaigns(context.workspaceId || WS);
+      const segs = await listSegments(context.workspaceId || WS);
+      return {
+        total_campaigns: camps.length,
+        campaigns: camps.map((c) => ({
+          id: c.id,
+          subject: c.subject,
+          status: c.status,
+          sent_count: c.sent_count,
+          created_at: c.created_at
+        })),
+        segments: segs.map((s) => ({
+          id: s.id,
+          name: s.name,
+          filter_tag: s.filter_tag
+        }))
+      };
+    }
+  },
+
+  list_billing_data: {
+    name: "list_billing_data",
+    description: "Retrieve available SaaS subscription plans, ticket tiers, active subscriptions, and MRR.",
+    riskTier: "low",
+    allowedRoles: ["admin", "marketer", "viewer"],
+    schema: z.object({}),
+    execute: async (_args, context) => {
+      const plans = await listPlans(context.workspaceId || WS);
+      const subs = await listSubscriptions(context.workspaceId || WS);
+      const activeSubs = subs.filter((s) => s.status === "active");
+      const mrrCents = activeSubs.reduce((acc, s) => acc + (s.mrr_cents || 0), 0);
+      return {
+        total_plans: plans.length,
+        plans: plans.map((p) => ({
+          id: p.id,
+          name: p.name,
+          price_cents: p.price_cents,
+          interval: p.interval
+        })),
+        active_subscriptions_count: activeSubs.length,
+        mrr_usd: (mrrCents / 100).toFixed(2)
+      };
     }
   },
 
@@ -91,8 +255,9 @@ export const tools: Record<string, AgentTool> = {
     }),
     execute: async (args, context) => {
       let date = args.scheduled_at;
-      if (!Date.parse(date)) {
-        // Calculate next Friday if string matches
+      if (!date || date.toLowerCase() === "now" || date.toLowerCase() === "instant") {
+        date = new Date().toISOString();
+      } else if (!Date.parse(date)) {
         const nextFri = new Date();
         nextFri.setDate(nextFri.getDate() + ((7 + 5 - nextFri.getDay()) % 7 || 7));
         nextFri.setHours(14, 0, 0, 0);

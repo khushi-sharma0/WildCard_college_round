@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createPage } from "@/lib/services";
+import { createPage, listPages } from "@/lib/services";
 import { getRole } from "@/lib/auth";
+
+export async function GET() {
+  try {
+    const pages = await listPages();
+    return NextResponse.json(pages);
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {

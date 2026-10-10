@@ -334,8 +334,10 @@ class MemoryStore {
   }
 }
 
-// Global singleton for memory fallback
-const globalMemoryStore = new MemoryStore();
+// Global singleton for memory fallback across Next.js route chunks
+const globalMemoryStore: MemoryStore =
+  (globalThis as any).__nexusMemoryStore ||
+  ((globalThis as any).__nexusMemoryStore = new MemoryStore());
 
 function getSupabase(): SupabaseClient | null {
   const url = process.env.SUPABASE_URL;
