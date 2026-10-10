@@ -234,10 +234,31 @@ interface WorkflowStepPlan {
 function classifyIntent(prompt: string): "conversation" | "analysis" | "workflow" {
   const p = prompt.toLowerCase().trim();
 
-  // 1. Multi-step action workflows
+  // 1. Direct Meeting & Webinar actions (e.g. "start an instant meeting", "instant meeting", "new meeting")
+  const isMeetingOrWebinarIntent =
+    /\b(meeting|meting|meeing|meetin|meating|meet|webinar|conference|video call|huddle|sync)\b/i.test(p);
+
+  if (
+    isMeetingOrWebinarIntent &&
+    !p.startsWith("what is") &&
+    !p.startsWith("what are") &&
+    !p.startsWith("how to") &&
+    !p.startsWith("how do i") &&
+    !p.startsWith("explain")
+  ) {
+    return "workflow";
+  }
+
+  // 2. Multi-step action workflows
   const actionTriggers = [
     "create",
     "launch",
+    "start",
+    "begin",
+    "open",
+    "host",
+    "spin up",
+    "book",
     "schedule",
     "publish",
     "draft",
@@ -1091,18 +1112,20 @@ async function handleWorkflowIntent(
 
   // 1. Dynamic Meeting vs Multi-Module Detection
   const wantsMeeting =
-    /\b(meeting|video call|conference|sync|call|jitsi)\b/i.test(prompt);
+    /\b(meeting|meting|meeing|meetin|meating|meet|video call|conference|sync|call|huddle|session|jitsi)\b/i.test(prompt) ||
+    scheduleData.isScheduled;
 
   const wantsWebinar =
-    /\b(webinar|presentation|briefing|session)\b/i.test(prompt) || wantsMeeting;
+    /\b(webinar|presentation|briefing)\b/i.test(prompt) || wantsMeeting;
+
+  const hasOtherModules =
+    /\b(landing|page|site|website)\b/i.test(prompt) ||
+    /\b(campaign|email my|broadcast|blast)\b/i.test(prompt) ||
+    /\b(ticket|pricing|plan|subscription|\$\d+)\b/i.test(prompt);
 
   // A direct meeting or webinar scheduling happens when the user asks to schedule/launch/start a meeting
   // without asking for landing pages, email marketing campaigns, or billing ticket plans
-  const isDirectMeetingLaunch =
-    (wantsMeeting || (/\b(schedule|launch|start|create|host)\b/i.test(prompt) && wantsWebinar)) &&
-    !/\b(landing|page|site|website)\b/i.test(prompt) &&
-    !/\b(campaign|email my|broadcast|blast)\b/i.test(prompt) &&
-    !/\b(ticket|pricing|plan|subscription|\$\d+)\b/i.test(prompt);
+  const isDirectMeetingLaunch = (wantsMeeting || wantsWebinar) && !hasOtherModules;
 
   // Dynamic Entity & Topic Extraction (using word boundaries to prevent substring collisions!)
   let targetTag = "retail";
