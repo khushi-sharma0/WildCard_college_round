@@ -16,14 +16,8 @@ import { formatCurrency } from "@/lib/utils";
 
 export const revalidate = 0;
 
-export default async function DashboardPage({
-  searchParams,
-}: {
-  searchParams?: { days?: string };
-}) {
-  const requestedDays = Number(searchParams?.days || 14);
-  const days = requestedDays === 7 || requestedDays === 30 ? requestedDays : 14;
-  const analytics = await queryAnalytics(undefined, days);
+export default async function DashboardPage() {
+  const analytics = await queryAnalytics();
   const { kpis, funnel, eventsOverTime } = analytics;
 
   return (
@@ -43,15 +37,6 @@ export default async function DashboardPage({
         </div>
 
         <div className="flex items-center gap-3">
-          <form method="get" className="flex items-center gap-2 border border-stone-300 bg-white px-3 py-2">
-            <label htmlFor="analytics-days" className="text-[10px] font-mono uppercase tracking-wider text-stone-500">Range</label>
-            <select id="analytics-days" name="days" defaultValue={days} className="bg-transparent text-xs font-mono font-bold text-stone-900">
-              <option value={7}>7 days</option>
-              <option value={14}>14 days</option>
-              <option value={30}>30 days</option>
-            </select>
-            <button type="submit" className="text-[10px] font-mono font-bold uppercase text-[#C85A32]">Apply</button>
-          </form>
           <Link
             href="/agent"
             className="flex items-center gap-2 px-6 py-3 rounded-none bg-[#C85A32] hover:bg-[#B94A26] text-white font-mono text-xs font-bold uppercase tracking-wider transition-all shadow-[2px_2px_0px_0px_#1C1917] hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_#1C1917]"
@@ -168,24 +153,6 @@ export default async function DashboardPage({
 
       {/* Visual Analytics */}
       <DashboardCharts funnel={funnel} eventsOverTime={eventsOverTime} />
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <div className="border border-stone-300 bg-white p-4 shadow-[2px_2px_0px_0px_#1C1917]">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-stone-500">Visitor → Registrant</div>
-          <div className="mt-1 font-serif text-2xl font-bold">{kpis.visitorsToRegistrants}%</div>
-        </div>
-        <div className="border border-stone-300 bg-white p-4 shadow-[2px_2px_0px_0px_#1C1917]">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-stone-500">Webinar Attendance</div>
-          <div className="mt-1 font-serif text-2xl font-bold">{kpis.webinarAttendanceRate}%</div>
-        </div>
-        <div className="border border-stone-300 bg-white p-4 shadow-[2px_2px_0px_0px_#1C1917]">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-stone-500">Active Subscriptions</div>
-          <div className="mt-1 font-serif text-2xl font-bold">{kpis.activeSubscriptions}</div>
-        </div>
-        <div className="border border-stone-300 bg-white p-4 shadow-[2px_2px_0px_0px_#1C1917]">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-stone-500">Contacts → Customers</div>
-          <div className="mt-1 font-serif text-2xl font-bold">{kpis.conversionRate}%</div>
-        </div>
-      </div>
     </div>
   );
 }

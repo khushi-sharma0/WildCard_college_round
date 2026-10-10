@@ -3,6 +3,15 @@ import { createAuditLog, createPage, listPages, listWebinars } from "@/lib/servi
 import { authorize, getRole, isUnauthenticatedError } from "@/lib/auth";
 import { pageSchema } from "@/lib/site-validation";
 
+export async function GET() {
+  try {
+    const pages = await listPages();
+    return NextResponse.json(pages);
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const role = await getRole();

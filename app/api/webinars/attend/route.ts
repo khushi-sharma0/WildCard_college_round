@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { toggleRegistrationAttended } from "@/lib/services";
-import { authorize, getRole, isUnauthenticatedError } from "@/lib/auth";
+import { getRole } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
   try {
     const role = await getRole();
-    if (!(await authorize(role, "webinar_write", "update_attendance"))) {
+    if (role === "viewer") {
       return NextResponse.json(
         { error: "Policy Blocked: Viewer cannot update attendance." },
         { status: 403 }
@@ -25,6 +25,6 @@ export async function POST(req: NextRequest) {
     await toggleRegistrationAttended(registrationId, attended);
     return NextResponse.json({ success: true, registrationId, attended });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: isUnauthenticatedError(error) ? 401 : 500 });
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

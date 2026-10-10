@@ -4,7 +4,6 @@ import React, { useState } from "react";
 import { AuditLog } from "@/lib/services";
 import {
   Search,
-  Download,
   Check,
   X,
   Clock,
@@ -23,52 +22,17 @@ export default function AuditView({
   const [riskFilter, setRiskFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
-  const [roleFilter, setRoleFilter] = useState("all");
-  const [actionFilter, setActionFilter] = useState("");
-  const [fromDate, setFromDate] = useState("");
-  const [toDate, setToDate] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const filteredLogs = logs.filter((log) => {
     const matchesRisk = riskFilter === "all" || log.risk === riskFilter;
     const matchesStatus = statusFilter === "all" || log.status === statusFilter;
-    const matchesRole = roleFilter === "all" || log.role === roleFilter;
-    const matchesAction = !actionFilter || log.tool.toLowerCase().includes(actionFilter.toLowerCase());
-    const logDate = log.created_at.slice(0, 10);
-    const matchesFrom = !fromDate || logDate >= fromDate;
-    const matchesTo = !toDate || logDate <= toDate;
     const matchesSearch =
       search === "" ||
       log.tool.toLowerCase().includes(search.toLowerCase()) ||
       log.role.toLowerCase().includes(search.toLowerCase());
-    return matchesRisk && matchesStatus && matchesRole && matchesAction &&
-      matchesFrom && matchesTo && matchesSearch;
+    return matchesRisk && matchesStatus && matchesSearch;
   });
-
-  function exportCsv() {
-    const escape = (value: unknown) => `"${String(value ?? "").replace(/"/g, '""')}"`;
-    const rows = [
-      ["timestamp", "role", "action", "risk", "result", "args", "details"].join(","),
-      ...filteredLogs.map((log) =>
-        [
-          log.created_at,
-          log.role,
-          log.tool,
-          log.risk,
-          log.status,
-          JSON.stringify(log.args),
-          JSON.stringify(log.result)
-        ].map(escape).join(",")
-      )
-    ];
-    const blob = new Blob([rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "nexus-audit-log.csv";
-    link.click();
-    URL.revokeObjectURL(url);
-  }
 
   const getRiskBadge = (risk: string) => {
     switch (risk) {
@@ -144,14 +108,8 @@ export default function AuditView({
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <div className="text-xs font-mono text-stone-600 bg-white px-3.5 py-1.5 rounded-none border border-stone-300 shadow-[1px_1px_0px_0px_#1C1917]">
-            Logged Actions: <span className="text-stone-900 font-bold">{logs.length}</span>
-          </div>
-          <button type="button" onClick={exportCsv} className="flex items-center gap-2 border border-stone-900 bg-white px-3 py-1.5 text-xs font-mono uppercase shadow-[1px_1px_0px_0px_#1C1917]">
-            <Download aria-hidden="true" className="h-3.5 w-3.5" />
-            Export CSV
-          </button>
+        <div className="text-xs font-mono text-stone-600 bg-white px-3.5 py-1.5 rounded-none border border-stone-300 shadow-[1px_1px_0px_0px_#1C1917]">
+          Logged Actions: <span className="text-stone-900 font-bold">{logs.length}</span>
         </div>
       </div>
 
@@ -169,18 +127,6 @@ export default function AuditView({
         </div>
 
         <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto">
-          <label className="flex items-center gap-2 text-[10px] font-mono uppercase text-stone-500">
-            Role
-            <select aria-label="Filter by role" value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)} className="border border-stone-300 bg-[#FAF8F5] px-2 py-1 text-xs text-stone-800">
-              <option value="all">All roles</option>
-              <option value="admin">Admin</option>
-              <option value="marketer">Marketer</option>
-              <option value="viewer">Viewer</option>
-            </select>
-          </label>
-          <input aria-label="Filter by action" value={actionFilter} onChange={(event) => setActionFilter(event.target.value)} placeholder="Action" className="w-28 border border-stone-300 bg-[#FAF8F5] px-2 py-1 text-xs" />
-          <label className="flex items-center gap-1 text-[10px] font-mono uppercase text-stone-500">From<input aria-label="From date" type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} className="border border-stone-300 bg-[#FAF8F5] px-1 py-1 text-xs" /></label>
-          <label className="flex items-center gap-1 text-[10px] font-mono uppercase text-stone-500">To<input aria-label="To date" type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} className="border border-stone-300 bg-[#FAF8F5] px-1 py-1 text-xs" /></label>
           {/* Risk Filter */}
           <div className="flex items-center gap-1 text-xs font-mono text-stone-500 uppercase tracking-wider">
             <span>Risk:</span>
