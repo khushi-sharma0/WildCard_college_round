@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { segment_id, subject, body: emailBody } = body;
+    const { segment_id, subject, body: emailBody, send_time } = body;
 
     if (!subject || !emailBody) {
       return NextResponse.json(
@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const campaign = await draftCampaign(segment_id, subject, emailBody);
+    const campaign = await draftCampaign(segment_id, subject, emailBody, send_time);
     return NextResponse.json(campaign);
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });

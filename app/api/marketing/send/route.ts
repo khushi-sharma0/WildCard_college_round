@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { campaign_id } = body;
+    const { campaign_id, simulated_recipients } = body;
 
     if (!campaign_id) {
       return NextResponse.json(
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const result = await sendCampaign(campaign_id);
+    const result = await sendCampaign(campaign_id, undefined, simulated_recipients, role);
     return NextResponse.json(result);
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
