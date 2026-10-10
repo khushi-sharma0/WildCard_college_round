@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import ToastViewport from "@/components/toast-viewport";
 
 export const metadata: Metadata = {
   title: "Nexus | Business Operating Platform",
@@ -15,6 +16,7 @@ export default function RootLayout({
     <html lang="en">
       <body className="min-h-screen bg-[#FAF8F5] text-stone-900 font-sans antialiased selection:bg-[#E8C2B3] selection:text-stone-900">
         {children}
+        <ToastViewport />
       </body>
     </html>
   );

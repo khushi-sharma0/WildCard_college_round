@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { decide } from "@/lib/agent/orchestrator";
-import { getRole } from "@/lib/auth";
+import { authorize, getRole, isUnauthenticatedError } from "@/lib/auth";
 
 export const maxDuration = 60;
 
@@ -8,8 +8,7 @@ export async function POST(req: NextRequest) {
   try {
     const role = await getRole();
 
-    // Verify Admin role
-    if (role !== "admin") {
+    if (!(await authorize(role, "approval_manage", "decide_agent_approval"))) {
       return NextResponse.json(
         { error: "Permission denied: Only an Admin can approve or reject high-risk agent operations." },
         { status: 403 }
@@ -32,7 +31,7 @@ export async function POST(req: NextRequest) {
     console.error("Decision error:", error);
     return NextResponse.json(
       { error: error.message || "Failed to process decision" },
-      { status: 500 }
+      { status: isUnauthenticatedError(error) ? 401 : 500 }
     );
   }
 }

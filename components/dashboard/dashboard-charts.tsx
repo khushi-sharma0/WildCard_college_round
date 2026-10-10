@@ -32,6 +32,10 @@ export default function DashboardCharts({
   funnel: FunnelItem[];
   eventsOverTime: EventTrendItem[];
 }) {
+  const hasFunnelData = funnel.some((item) => item.count > 0);
+  const hasEventData = eventsOverTime.some(
+    (item) => item.views > 0 || item.leads > 0 || item.registrations > 0 || item.emails > 0
+  );
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
       {/* Funnel Chart */}
@@ -45,6 +49,11 @@ export default function DashboardCharts({
         </div>
 
         <div className="h-72 w-full pt-2">
+          {!hasFunnelData ? (
+            <div className="flex h-full items-center justify-center text-xs font-mono text-stone-500">
+              No conversion activity in this period.
+            </div>
+          ) : (
           <ResponsiveContainer width="100%" height="100%">
             <BarChart
               data={funnel}
@@ -77,6 +86,7 @@ export default function DashboardCharts({
               <Bar dataKey="count" fill="#C85A32" radius={[0, 0, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
+          )}
         </div>
       </div>
 
@@ -106,6 +116,11 @@ export default function DashboardCharts({
         </div>
 
         <div className="h-72 w-full pt-2">
+          {!hasEventData ? (
+            <div className="flex h-full items-center justify-center text-xs font-mono text-stone-500">
+              No tracked events in this period.
+            </div>
+          ) : (
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={eventsOverTime} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
               <defs>
@@ -158,6 +173,7 @@ export default function DashboardCharts({
               />
             </AreaChart>
           </ResponsiveContainer>
+          )}
         </div>
       </div>
     </div>

@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Authentication users, sessions, and profiles are managed by Supabase Auth.
+
 -- 2. CONTACTS (CRM)
 CREATE TABLE IF NOT EXISTS contacts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -53,12 +55,28 @@ CREATE TABLE IF NOT EXISTS pages (
     html TEXT,
     css TEXT,
     gjs_data JSONB,
+    builder_data JSONB,
     is_published BOOLEAN DEFAULT true,
+    theme_color TEXT NOT NULL DEFAULT '#C85A32',
+    linked_webinar_id UUID,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS theme_color TEXT NOT NULL DEFAULT '#C85A32';
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS linked_webinar_id UUID;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS builder_data JSONB;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_workspace_slug ON pages(workspace_id, slug);
+
+CREATE TABLE IF NOT EXISTS site_themes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name TEXT NOT NULL DEFAULT 'My Theme',
+    theme_data JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (workspace_id, name)
+);
 
 -- 5. PLANS (SaaS Billing)
 CREATE TABLE IF NOT EXISTS plans (
@@ -100,6 +118,56 @@ CREATE TABLE IF NOT EXISTS registrations (
 CREATE INDEX IF NOT EXISTS idx_registrations_webinar ON registrations(webinar_id);
 CREATE INDEX IF NOT EXISTS idx_registrations_contact ON registrations(contact_id);
 
+WITH ranked_webinars AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(title)), scheduled_at
+               ORDER BY created_at, id
+           ) AS keeper_id,
+           row_number() OVER (
+               PARTITION BY workspace_id, lower(trim(title)), scheduled_at
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM webinars
+)
+UPDATE registrations AS registration
+SET webinar_id = ranked_webinars.keeper_id
+FROM ranked_webinars
+WHERE registration.webinar_id = ranked_webinars.id
+  AND ranked_webinars.duplicate_rank > 1;
+
+WITH ranked_webinars AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY workspace_id, lower(trim(title)), scheduled_at
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM webinars
+)
+DELETE FROM webinars AS webinar
+USING ranked_webinars
+WHERE webinar.id = ranked_webinars.id
+  AND ranked_webinars.duplicate_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webinars_workspace_title_schedule
+    ON webinars(workspace_id, lower(trim(title)), scheduled_at);
+
+WITH ranked_registrations AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY webinar_id, contact_id
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM registrations
+)
+DELETE FROM registrations AS registration
+USING ranked_registrations
+WHERE registration.id = ranked_registrations.id
+  AND ranked_registrations.duplicate_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_webinar_contact
+    ON registrations(webinar_id, contact_id);
+
 -- 8. SUBSCRIPTIONS (Fake SaaS Billing)
 CREATE TABLE IF NOT EXISTS subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -113,11 +181,119 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_workspace ON subscriptions(workspace_id);
 
+WITH ranked_contacts AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(email))
+               ORDER BY created_at, id
+           ) AS keeper_id
+    FROM contacts
+),
+ranked_merged_registrations AS (
+    SELECT registrations.id,
+           row_number() OVER (
+               PARTITION BY registrations.webinar_id, ranked_contacts.keeper_id
+               ORDER BY registrations.created_at, registrations.id
+           ) AS duplicate_rank
+    FROM registrations
+    JOIN ranked_contacts ON ranked_contacts.id = registrations.contact_id
+)
+DELETE FROM registrations AS registration
+USING ranked_merged_registrations
+WHERE registration.id = ranked_merged_registrations.id
+  AND ranked_merged_registrations.duplicate_rank > 1;
+
+WITH ranked_contacts AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(email))
+               ORDER BY created_at, id
+           ) AS keeper_id
+    FROM contacts
+)
+UPDATE registrations AS registration
+SET contact_id = ranked_contacts.keeper_id
+FROM ranked_contacts
+WHERE registration.contact_id = ranked_contacts.id
+  AND ranked_contacts.id <> ranked_contacts.keeper_id;
+
+WITH ranked_contacts AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(email))
+               ORDER BY created_at, id
+           ) AS keeper_id
+    FROM contacts
+),
+ranked_merged_subscriptions AS (
+    SELECT subscriptions.id,
+           row_number() OVER (
+               PARTITION BY subscriptions.workspace_id, ranked_contacts.keeper_id, subscriptions.plan_id
+               ORDER BY subscriptions.created_at, subscriptions.id
+           ) AS duplicate_rank
+    FROM subscriptions
+    JOIN ranked_contacts ON ranked_contacts.id = subscriptions.contact_id
+    WHERE subscriptions.status = 'active'
+)
+DELETE FROM subscriptions AS subscription
+USING ranked_merged_subscriptions
+WHERE subscription.id = ranked_merged_subscriptions.id
+  AND ranked_merged_subscriptions.duplicate_rank > 1;
+
+WITH ranked_contacts AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(email))
+               ORDER BY created_at, id
+           ) AS keeper_id
+    FROM contacts
+)
+UPDATE subscriptions AS subscription
+SET contact_id = ranked_contacts.keeper_id
+FROM ranked_contacts
+WHERE subscription.contact_id = ranked_contacts.id
+  AND ranked_contacts.id <> ranked_contacts.keeper_id;
+
+WITH ranked_contacts AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY workspace_id, lower(trim(email))
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM contacts
+)
+DELETE FROM contacts AS contact
+USING ranked_contacts
+WHERE contact.id = ranked_contacts.id
+  AND ranked_contacts.duplicate_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_workspace_email_lower
+    ON contacts(workspace_id, lower(trim(email)));
+
+WITH ranked_subscriptions AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY workspace_id, contact_id, plan_id
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM subscriptions
+    WHERE status = 'active'
+)
+DELETE FROM subscriptions AS subscription
+USING ranked_subscriptions
+WHERE subscription.id = ranked_subscriptions.id
+  AND ranked_subscriptions.duplicate_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_active_contact_plan
+    ON subscriptions(workspace_id, contact_id, plan_id)
+    WHERE status = 'active';
+
 -- 9. CAMPAIGNS (Marketing Automation)
 CREATE TABLE IF NOT EXISTS campaigns (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+    idempotency_key TEXT,
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
     status TEXT DEFAULT 'draft', -- 'draft', 'sending', 'sent'
@@ -127,6 +303,59 @@ CREATE TABLE IF NOT EXISTS campaigns (
 );
 
 CREATE INDEX IF NOT EXISTS idx_campaigns_workspace ON campaigns(workspace_id);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_idempotency
+    ON campaigns(workspace_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+WITH ranked_drafts AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY workspace_id, coalesce(segment_id::text, ''), lower(trim(subject)), body
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM campaigns
+    WHERE status = 'draft'
+)
+DELETE FROM campaigns AS campaign
+USING ranked_drafts
+WHERE campaign.id = ranked_drafts.id
+  AND ranked_drafts.duplicate_rank > 1;
+
+-- Keep one saved audience per normalized tag before enforcing idempotent creation.
+WITH ranked_segments AS (
+    SELECT id,
+           first_value(id) OVER (
+               PARTITION BY workspace_id, lower(trim(filter_tag))
+               ORDER BY created_at, id
+           ) AS keeper_id,
+           row_number() OVER (
+               PARTITION BY workspace_id, lower(trim(filter_tag))
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM segments
+)
+UPDATE campaigns AS campaign
+SET segment_id = ranked_segments.keeper_id
+FROM ranked_segments
+WHERE campaign.segment_id = ranked_segments.id
+  AND ranked_segments.duplicate_rank > 1;
+
+WITH ranked_segments AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY workspace_id, lower(trim(filter_tag))
+               ORDER BY created_at, id
+           ) AS duplicate_rank
+    FROM segments
+)
+DELETE FROM segments AS segment
+USING ranked_segments
+WHERE segment.id = ranked_segments.id
+  AND ranked_segments.duplicate_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_workspace_tag
+    ON segments(workspace_id, lower(trim(filter_tag)));
 
 -- 10. EVENTS (Analytics Stream)
 CREATE TABLE IF NOT EXISTS events (
@@ -164,11 +393,17 @@ CREATE TABLE IF NOT EXISTS approvals (
     tool TEXT NOT NULL,
     args JSONB NOT NULL,
     status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
+    requested_by TEXT,
+    reason TEXT,
     decided_by TEXT,
+    decided_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_run ON approvals(run_id);
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS requested_by TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
 
 -- 13. AUDIT LOGS (Compliance & Security)
 CREATE TABLE IF NOT EXISTS audit_logs (

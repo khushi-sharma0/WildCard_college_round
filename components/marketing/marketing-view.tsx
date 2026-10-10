@@ -12,6 +12,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { formatDate } from "@/lib/utils";
+import { notifyToast } from "@/lib/toast";
 
 export default function MarketingView({
   initialCampaigns,
@@ -58,8 +59,10 @@ export default function MarketingView({
       setShowDraftModal(false);
       setSubject("");
       setBody("");
+      notifyToast("success", "Campaign draft saved.");
     } catch (err: any) {
       setError(err.message);
+      notifyToast("error", err.message || "Failed to draft campaign.");
     } finally {
       setDraftLoading(false);
     }
@@ -80,6 +83,11 @@ export default function MarketingView({
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to dispatch campaign");
+      if (data.pendingApproval) {
+        setConfirmSendCampaign(null);
+        notifyToast("success", "Large send queued for Admin approval.");
+        return;
+      }
 
       setCampaigns((prev) =>
         prev.map((c) =>
@@ -93,8 +101,10 @@ export default function MarketingView({
         `Dispatched ${data.sent_count} emails. ${data.note || "Mailtrap sandbox delivered"}`
       );
       setConfirmSendCampaign(null);
+      notifyToast("success", `Campaign sent to ${data.sent_count} recipients.`);
     } catch (err: any) {
       setError(err.message);
+      notifyToast("error", err.message || "Failed to dispatch campaign.");
     } finally {
       setSendLoading(false);
     }
@@ -149,6 +159,11 @@ export default function MarketingView({
 
       {/* Campaigns Table */}
       <div className="rounded-none bg-white border border-stone-300 shadow-[3px_3px_0px_0px_#1C1917] overflow-hidden">
+        {campaigns.length === 0 && (
+          <p className="border-b border-stone-200 p-8 text-center text-sm text-stone-500">
+            No campaigns yet. Draft a campaign to get started.
+          </p>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-[#F5F2EB] border-b border-stone-300 text-stone-600 uppercase font-mono tracking-wider text-[10px]">
@@ -326,6 +341,8 @@ export default function MarketingView({
                 <input
                   type="text"
                   required
+                  minLength={3}
+                  maxLength={200}
                   value={subject}
                   onChange={(e) => setSubject(e.target.value)}
                   placeholder="e.g. Invitation: Next-Gen AI in Retail Masterclass"
@@ -340,6 +357,8 @@ export default function MarketingView({
                 <textarea
                   rows={5}
                   required
+                  minLength={20}
+                  maxLength={10000}
                   value={body}
                   onChange={(e) => setBody(e.target.value)}
                   placeholder="Hi {{name}},\n\nJoin our upcoming session to explore automated inventory planning..."
