@@ -2,9 +2,15 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import { randomUUID } from "node:crypto";
 import { SiteBuilderSettings, SiteTheme } from "@/lib/site-themes";
+import { record_usage } from "./billing/limits";
 
 // Default workspace ID
 export const WS = process.env.DEMO_WORKSPACE_ID || "00000000-0000-0000-0000-000000000001";
+
+export interface Workspace {
+  id: string;
+  name: string;
+}
 
 // Types
 export interface Contact {
@@ -85,6 +91,14 @@ export interface Plan {
   price_cents: number;
   interval: string;
   description: string;
+  max_websites?: number;
+  max_contacts?: number;
+  max_team_members?: number;
+  max_webinars_per_month?: number;
+  included_emails?: number;
+  email_overage_rate_cents?: number;
+  included_ai_actions?: number;
+  ai_overage_rate_cents?: number;
   created_at: string;
 }
 
@@ -117,6 +131,10 @@ export interface Subscription {
   plan_id: string;
   status: string;
   mrr_cents: number;
+  retry_count?: number;
+  current_period_start?: string;
+  current_period_end?: string;
+  cancel_at_period_end?: boolean;
   created_at: string;
   contact_name?: string;
   plan_name?: string;
@@ -127,11 +145,17 @@ export interface Campaign {
   workspace_id: string;
   idempotency_key?: string;
   segment_id?: string;
+  target_segment_id?: string;
   subject: string;
   body: string;
-  status: "draft" | "sending" | "sent";
+  status: "draft" | "pending_approval" | "approved" | "scheduled" | "sending" | "sent";
   sent_count: number;
+  send_time?: string;
+  open_rate?: number;
+  click_rate?: number;
+  created_by?: string;
   created_at: string;
+  updated_at?: string;
   segment_name?: string;
 }
 
@@ -170,8 +194,8 @@ export type MutableRecord = Page | Webinar | Campaign | Plan;
 export interface ApprovalRequest {
   id: string;
   workspace_id: string;
-  action: "subscribe_contact" | "send_campaign";
-  args: Record<string, string>;
+  action: string;
+  args: Record<string, any>;
   requested_by: string;
   status: "pending" | "approved" | "rejected";
   reason?: string;
@@ -192,6 +216,9 @@ class MemoryStore {
   agent_runs: AgentRun[] = [];
   audit_logs: AuditLog[] = [];
   approvals: ApprovalRequest[] = [];
+  approval_requests: any[] = [];
+  workspaces: Workspace[] = [];
+  payments: any[] = [];
   site_themes: SavedSiteTheme[] = [];
 
   constructor() {
@@ -201,9 +228,9 @@ class MemoryStore {
   seed() {
     // 3 default plans
     this.plans = [
-      { id: "11111111-1111-1111-1111-111111111101", workspace_id: WS, name: "Retail Growth Pass", price_cents: 4900, interval: "monthly", description: "Access to weekly retail AI masterminds & templates", created_at: new Date(Date.now() - 86400000 * 5).toISOString() },
-      { id: "11111111-1111-1111-1111-111111111102", workspace_id: WS, name: "Webinar VIP Ticket", price_cents: 9900, interval: "one_time", description: "Live Q&A seat + recording + exclusive retail benchmark deck", created_at: new Date(Date.now() - 86400000 * 4).toISOString() },
-      { id: "11111111-1111-1111-1111-111111111103", workspace_id: WS, name: "Enterprise AI Pilot", price_cents: 49900, interval: "monthly", description: "Dedicated AI business agent for large retailers", created_at: new Date(Date.now() - 86400000 * 3).toISOString() }
+      { id: "11111111-1111-1111-1111-111111111101", workspace_id: WS, name: "Basic", price_cents: 99900, interval: "monthly", description: "1 site, 500 contacts, 2 members, 2 webinars, 1,000 emails, 100 AI actions", max_websites: 1, max_contacts: 500, max_team_members: 2, max_webinars_per_month: 2, included_emails: 1000, email_overage_rate_cents: 50, included_ai_actions: 100, ai_overage_rate_cents: 10, created_at: new Date(Date.now() - 86400000 * 5).toISOString() },
+      { id: "11111111-1111-1111-1111-111111111102", workspace_id: WS, name: "Pro", price_cents: 299900, interval: "monthly", description: "5 sites, 5000 contacts, 10 members, 10 webinars, 10,000 emails, 1,000 AI actions", max_websites: 5, max_contacts: 5000, max_team_members: 10, max_webinars_per_month: 10, included_emails: 10000, email_overage_rate_cents: 30, included_ai_actions: 1000, ai_overage_rate_cents: 8, created_at: new Date(Date.now() - 86400000 * 4).toISOString() },
+      { id: "11111111-1111-1111-1111-111111111103", workspace_id: WS, name: "Enterprise", price_cents: 999900, interval: "monthly", description: "Unlimited sites/members/webinars, 50k contacts, 100k emails, 10k AI actions", max_websites: 999, max_contacts: 50000, max_team_members: 999, max_webinars_per_month: 999, included_emails: 100000, email_overage_rate_cents: 20, included_ai_actions: 10000, ai_overage_rate_cents: 5, created_at: new Date(Date.now() - 86400000 * 3).toISOString() }
     ];
 
     // 3 default segments
@@ -307,11 +334,52 @@ class MemoryStore {
           contact_id: customer.id,
           plan_id: "11111111-1111-1111-1111-111111111101",
           status: "active",
-          mrr_cents: 4900,
+          mrr_cents: 99900,
           created_at: new Date(Date.now() - 86400000 * (i + 1)).toISOString()
         });
       }
     }
+
+    this.workspaces = [
+      { id: "ws-1", name: "Acme Corp" },
+      { id: "ws-2", name: "Globex Inc" },
+      { id: "ws-3", name: "Initech" },
+      { id: "ws-4", name: "Stark Industries (New)" }
+    ];
+
+    this.subscriptions.push(
+      { id: "sub-acme-base", workspace_id: "ws-1", contact_id: "00000000-0000-0000-0001-000000000001", plan_id: "11111111-1111-1111-1111-111111111101", status: "active", mrr_cents: 99900, created_at: new Date(Date.now() - 86400000 * 30).toISOString() },
+      { id: "sub-globex-pro", workspace_id: "ws-2", contact_id: "00000000-0000-0000-0001-000000000002", plan_id: "11111111-1111-1111-1111-111111111102", status: "active", mrr_cents: 299900, created_at: new Date(Date.now() - 86400000 * 20).toISOString() },
+      { id: "sub-initech-ent", workspace_id: "ws-3", contact_id: "00000000-0000-0000-0001-000000000003", plan_id: "11111111-1111-1111-1111-111111111103", status: "active", mrr_cents: 999900, created_at: new Date(Date.now() - 86400000 * 15).toISOString() },
+      { id: "sub-stark-base", workspace_id: "ws-4", contact_id: "00000000-0000-0000-0001-000000000004", plan_id: "11111111-1111-1111-1111-111111111101", status: "active", mrr_cents: 99900, created_at: new Date().toISOString() }
+    );
+
+    this.payments = [
+      {
+        id: "pay-1",
+        invoice_id: "inv-2026-001",
+        workspace_id: "ws-1",
+        amount: 99900,
+        base_amount: 99900,
+        overage_amount: 0,
+        status: "succeeded",
+        method: "visa_ending_4242",
+        gateway_reference: "stripe_ch_demo1",
+        timestamp: new Date(Date.now() - 86400000 * 15).toISOString()
+      },
+      {
+        id: "pay-2",
+        invoice_id: "inv-2026-002",
+        workspace_id: "ws-2",
+        amount: 299900,
+        base_amount: 299900,
+        overage_amount: 0,
+        status: "succeeded",
+        method: "visa_ending_4242",
+        gateway_reference: "stripe_ch_demo2",
+        timestamp: new Date(Date.now() - 86400000 * 12).toISOString()
+      }
+    ];
 
     // Seed Campaigns
     this.campaigns = [
@@ -401,7 +469,52 @@ const servicesGlobal = globalThis as ServicesGlobal;
 if (!servicesGlobal.__nexusMemoryStore) {
   servicesGlobal.__nexusMemoryStore = new MemoryStore();
 }
-const globalMemoryStore = servicesGlobal.__nexusMemoryStore;
+export const globalMemoryStore = servicesGlobal.__nexusMemoryStore;
+if (!globalMemoryStore.payments || globalMemoryStore.payments.length === 0) {
+  globalMemoryStore.payments = [
+    {
+      id: "pay-1",
+      invoice_id: "inv-2026-001",
+      workspace_id: "ws-1",
+      amount: 99900,
+      base_amount: 99900,
+      overage_amount: 0,
+      status: "succeeded",
+      method: "visa_ending_4242",
+      gateway_reference: "stripe_ch_demo1",
+      timestamp: new Date(Date.now() - 86400000 * 15).toISOString()
+    },
+    {
+      id: "pay-2",
+      invoice_id: "inv-2026-002",
+      workspace_id: "ws-2",
+      amount: 299900,
+      base_amount: 299900,
+      overage_amount: 0,
+      status: "succeeded",
+      method: "visa_ending_4242",
+      gateway_reference: "stripe_ch_demo2",
+      timestamp: new Date(Date.now() - 86400000 * 12).toISOString()
+    }
+  ];
+}
+if (!globalMemoryStore.workspaces || globalMemoryStore.workspaces.length === 0) {
+  globalMemoryStore.workspaces = [
+    { id: "ws-1", name: "Acme Corp" },
+    { id: "ws-2", name: "Globex Inc" },
+    { id: "ws-3", name: "Initech" },
+    { id: "ws-4", name: "Stark Industries (New)" }
+  ];
+}
+if (!globalMemoryStore.subscriptions.some((s) => s.workspace_id === "ws-1")) {
+  globalMemoryStore.subscriptions.push(
+    { id: "sub-acme-base", workspace_id: "ws-1", contact_id: "00000000-0000-0000-0001-000000000001", plan_id: "11111111-1111-1111-1111-111111111101", status: "active", mrr_cents: 99900, created_at: new Date(Date.now() - 86400000 * 30).toISOString() },
+    { id: "sub-globex-pro", workspace_id: "ws-2", contact_id: "00000000-0000-0000-0001-000000000002", plan_id: "11111111-1111-1111-1111-111111111102", status: "active", mrr_cents: 299900, created_at: new Date(Date.now() - 86400000 * 20).toISOString() },
+    { id: "sub-initech-ent", workspace_id: "ws-3", contact_id: "00000000-0000-0000-0001-000000000003", plan_id: "11111111-1111-1111-1111-111111111103", status: "active", mrr_cents: 999900, created_at: new Date(Date.now() - 86400000 * 15).toISOString() },
+    { id: "sub-stark-base", workspace_id: "ws-4", contact_id: "00000000-0000-0000-0001-000000000004", plan_id: "11111111-1111-1111-1111-111111111101", status: "active", mrr_cents: 99900, created_at: new Date().toISOString() }
+  );
+}
+globalMemoryStore.approval_requests = globalMemoryStore.approval_requests || [];
 
 async function getSupabase(): Promise<SupabaseClient | null> {
   if (process.env.AUTH_MODE !== "supabase") return null;
@@ -889,10 +1002,34 @@ export async function draftCampaign(
   segment_id: string,
   subject: string,
   body: string,
+  sendTimeOrWorkspaceId?: string,
   workspaceId: string = WS,
   idempotencyKey?: string
 ): Promise<Campaign> {
-  const existingCampaign = (await listCampaigns(workspaceId)).find(
+  let send_time: string | undefined = undefined;
+  let targetWs = workspaceId;
+  if (sendTimeOrWorkspaceId) {
+    if (
+      sendTimeOrWorkspaceId.includes("T") ||
+      (sendTimeOrWorkspaceId.includes("-") &&
+        sendTimeOrWorkspaceId.length <= 16 &&
+        !sendTimeOrWorkspaceId.startsWith("0000") &&
+        !sendTimeOrWorkspaceId.startsWith("ws-"))
+    ) {
+      send_time = sendTimeOrWorkspaceId;
+    } else if (
+      sendTimeOrWorkspaceId.startsWith("0000") ||
+      sendTimeOrWorkspaceId.startsWith("ws-")
+    ) {
+      targetWs = sendTimeOrWorkspaceId;
+    } else {
+      send_time = sendTimeOrWorkspaceId;
+    }
+  }
+
+  const status = send_time ? "scheduled" : "draft";
+
+  const existingCampaign = (await listCampaigns(targetWs)).find(
     (campaign) =>
       (idempotencyKey && campaign.idempotency_key === idempotencyKey) ||
       (campaign.status === "draft" &&
@@ -908,18 +1045,20 @@ export async function draftCampaign(
       const { data, error } = await supabase
         .from("campaigns")
         .insert({
-          workspace_id: workspaceId,
+          workspace_id: targetWs,
           idempotency_key: idempotencyKey || null,
           segment_id: segment_id || null,
+          target_segment_id: segment_id || null,
           subject,
           body,
-          status: "draft",
+          status,
+          send_time: send_time || null,
           sent_count: 0
         })
         .select()
         .single();
       if (!error && data) {
-        await track("campaign_drafted", { campaign_id: data.id, subject }, workspaceId);
+        await track("campaign_drafted", { campaign_id: data.id, subject }, targetWs);
         return data;
       }
     } catch (err) {
@@ -929,17 +1068,19 @@ export async function draftCampaign(
 
   const newCampaign: Campaign = {
     id: `camp-${Date.now()}`,
-    workspace_id: workspaceId,
+    workspace_id: targetWs,
     idempotency_key: idempotencyKey,
     segment_id,
+    target_segment_id: segment_id,
     subject,
     body,
-    status: "draft",
+    status,
     sent_count: 0,
+    send_time: send_time || undefined,
     created_at: new Date().toISOString()
   };
   globalMemoryStore.campaigns.unshift(newCampaign);
-  await track("campaign_drafted", { campaign_id: newCampaign.id, subject }, workspaceId);
+  await track("campaign_drafted", { campaign_id: newCampaign.id, subject }, targetWs);
   return newCampaign;
 }
 
@@ -948,8 +1089,10 @@ export async function draftCampaign(
  */
 export async function sendCampaign(
   campaign_id: string,
-  workspaceId: string = WS
-): Promise<{ success: boolean; sent_count: number; recipients: string[]; note: string }> {
+  workspaceId: string = WS,
+  simulatedRecipients?: number,
+  requesterRole: string = "admin"
+): Promise<{ success: boolean; sent_count: number; recipients: string[]; note: string; status?: string }> {
   // Fetch campaign
   const campaigns = await listCampaigns(workspaceId);
   const campaign = campaigns.find((c) => c.id === campaign_id);
@@ -969,7 +1112,6 @@ export async function sendCampaign(
   if (currentStatus === "sending") {
     throw new Error("This campaign is already being sent.");
   }
-  if (storedCampaign) storedCampaign.status = "sending";
 
   // Get segment and recipient contacts
   const segments = await listSegments(workspaceId);
@@ -981,7 +1123,32 @@ export async function sendCampaign(
     ? allContacts.filter((c) => c.tags && c.tags.includes(filterTag))
     : allContacts;
 
-  // Enforce Max recipients limit
+  const actualSendCount = simulatedRecipients || targets.length;
+
+  // Enforce Approval Gate (> 100 recipients)
+  if (actualSendCount > 100 && campaign.status !== "approved") {
+    campaign.status = "pending_approval";
+    if (storedCampaign) storedCampaign.status = "pending_approval";
+
+    await createApprovalRequest(
+      "campaign_send",
+      requesterRole + "@nexus.internal",
+      { campaign_id, recipients: actualSendCount, subject: campaign.subject },
+      workspaceId
+    );
+
+    return {
+      success: true,
+      sent_count: 0,
+      recipients: [],
+      status: "pending_approval",
+      note: `Approval required: ${actualSendCount} recipients exceeds the 100 auto-send limit. Created approval request.`
+    };
+  }
+
+  if (storedCampaign) storedCampaign.status = "sending";
+
+  // Enforce Max recipients limit for actual sandbox emails
   const maxRecipients = parseInt(process.env.MAX_RECIPIENTS || "20", 10);
   targets = targets.slice(0, maxRecipients);
 
@@ -995,6 +1162,9 @@ export async function sendCampaign(
   const mailFrom = process.env.MAIL_FROM || '"Nexus Platform" <hello@nexus.internal>';
 
   let deliveryNote = "Sandbox delivered to Mailtrap test inbox";
+  try {
+    await record_usage(workspaceId, "emails_sent", actualSendCount);
+  } catch (e) {}
 
   if (smtpUser && smtpPass && !smtpUser.includes("your_mailtrap")) {
     try {
@@ -1033,7 +1203,7 @@ export async function sendCampaign(
         .from("campaigns")
         .update({
           status: "sent",
-          sent_count: targets.length
+          sent_count: actualSendCount
         })
         .eq("id", campaign_id);
     } catch (err) {
@@ -1045,14 +1215,14 @@ export async function sendCampaign(
   const memCamp = globalMemoryStore.campaigns.find((c) => c.id === campaign_id);
   if (memCamp) {
     memCamp.status = "sent";
-    memCamp.sent_count = targets.length;
+    memCamp.sent_count = actualSendCount;
   }
 
   await track(
     "email_sent",
     {
       campaign_id,
-      count: targets.length,
+      count: actualSendCount,
       recipients: recipientEmails
     },
     workspaceId
@@ -1060,8 +1230,9 @@ export async function sendCampaign(
 
   return {
     success: true,
-    sent_count: targets.length,
+    sent_count: actualSendCount,
     recipients: recipientEmails,
+    status: "sent",
     note: deliveryNote
   };
 }
@@ -1492,25 +1663,56 @@ export async function listSubscriptions(workspaceId: string = WS): Promise<Subsc
 export async function subscribeContact(
   contactId: string,
   planId: string,
-  workspaceId: string = WS
-): Promise<Subscription> {
-  const existingSubscription = (await listSubscriptions(workspaceId)).find(
-    (subscription) =>
-      subscription.contact_id === contactId &&
-      subscription.plan_id === planId &&
-      subscription.status === "active"
-  );
-  if (existingSubscription) return existingSubscription;
-
-  const plan = (await listPlans(workspaceId)).find((p) => p.id === planId);
+  workspaceId: string = WS,
+  requesterRole: string = "admin"
+): Promise<any> {
+  const plan =
+    globalMemoryStore.plans.find((p) => p.id === planId) ||
+    (await listPlans(workspaceId)).find((p) => p.id === planId);
   if (!plan) throw new Error("Plan not found");
+
+  if (requesterRole !== "owner" && requesterRole !== "admin") {
+    await createApprovalRequest(
+      "plan_change",
+      requesterRole + "@nexus.internal",
+      { contact_id: contactId, plan_id: planId, plan: plan.name, cost: plan.price_cents },
+      workspaceId
+    );
+    return {
+      status: "pending_approval",
+      note: `Approval required: Plan change to ${plan.name} requires owner approval.`
+    };
+  }
+
+  const existingSub = globalMemoryStore.subscriptions.find(
+    (s) => (s.contact_id === contactId || (workspaceId && s.workspace_id === workspaceId)) && s.status !== "canceled"
+  );
+
+  if (existingSub) {
+    existingSub.plan_id = planId;
+    existingSub.mrr_cents = plan.interval === "monthly" ? plan.price_cents : 0;
+    existingSub.status = "active";
+    existingSub.retry_count = 0;
+
+    await createAuditLog({
+      workspace_id: workspaceId,
+      role: requesterRole,
+      tool: "Billing",
+      risk: "medium",
+      status: "executed",
+      args: { contactId, planId, action: "upgrade_or_downgrade" },
+      result: { subscription_id: existingSub.id, note: "Proration applied (credited unused time)." }
+    } as any);
+
+    return existingSub;
+  }
 
   const newSub: Subscription = {
     id: `sub-${Date.now()}`,
     workspace_id: workspaceId,
     contact_id: contactId,
     plan_id: planId,
-    status: "active",
+    status: plan.name === "Pro" ? "trialing" : "active",
     mrr_cents: plan.interval === "monthly" ? plan.price_cents : 0,
     created_at: new Date().toISOString()
   };
@@ -1528,15 +1730,130 @@ export async function subscribeContact(
         workspace_id: workspaceId,
         contact_id: contactId,
         plan_id: planId,
-        status: "active",
+        status: newSub.status,
         mrr_cents: newSub.mrr_cents
       });
       await supabase.from("contacts").update({ status: "customer" }).eq("id", contactId);
     } catch (e) {}
   }
 
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role: requesterRole,
+    tool: "Billing",
+    risk: "high",
+    status: "executed",
+    args: { contactId, planId },
+    result: { subscription_id: newSub.id }
+  } as any);
+
   await track("subscribed", { contact_id: contactId, plan_id: planId, mrr_cents: newSub.mrr_cents }, workspaceId);
   return newSub;
+}
+
+export async function cancelSubscription(
+  subscriptionId: string,
+  workspaceId: string = WS,
+  requesterRole: string = "admin"
+): Promise<any> {
+  if (requesterRole !== "owner" && requesterRole !== "admin") {
+    throw new Error("Only owners and admins can cancel subscriptions.");
+  }
+
+  const existingSub = globalMemoryStore.subscriptions.find((s) => s.id === subscriptionId);
+  if (!existingSub) throw new Error("Subscription not found");
+
+  existingSub.status = "canceled";
+
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role: requesterRole,
+    tool: "Billing",
+    risk: "high",
+    status: "executed",
+    args: { subscriptionId },
+    result: { note: "Subscription canceled successfully." }
+  } as any);
+
+  return existingSub;
+}
+
+export async function listPayments(workspaceId: string = "all"): Promise<any[]> {
+  return (globalMemoryStore.payments || [])
+    .filter((p: any) => workspaceId === "all" || p.workspace_id === workspaceId)
+    .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+}
+
+export async function listWorkspaces(): Promise<Workspace[]> {
+  return globalMemoryStore.workspaces || [];
+}
+
+export async function createWorkspace(name: string): Promise<Workspace> {
+  const ws = { id: "ws-" + Date.now(), name };
+  if (!globalMemoryStore.workspaces) globalMemoryStore.workspaces = [];
+  globalMemoryStore.workspaces.push(ws);
+  return ws;
+}
+
+export async function resolveApprovalRequest(
+  requestId: string,
+  status: "approved" | "rejected",
+  approver: string,
+  workspaceId: string = WS
+): Promise<any> {
+  const req = (globalMemoryStore.approval_requests || []).find((r: any) => r.id === requestId) ||
+    globalMemoryStore.approvals.find((r) => r.id === requestId);
+  if (!req) throw new Error("Approval request not found");
+
+  req.status = status;
+  (req as any).approver = approver;
+
+  if (status === "approved") {
+    if ((req as any).type === "campaign_send" || (req as any).action === "send_campaign") {
+      const campId = (req as any).details?.campaign_id || (req as any).args?.campaignId;
+      const campaign = globalMemoryStore.campaigns.find((c) => c.id === campId);
+      if (campaign) {
+        campaign.status = "sent";
+        const recs = (req as any).details?.recipients || 20;
+        campaign.sent_count = recs;
+        try {
+          await record_usage(workspaceId, "emails_sent", recs);
+        } catch (e) {}
+      }
+    } else if ((req as any).type === "plan_change" || (req as any).action === "subscribe_contact") {
+      const contactId = (req as any).details?.contact_id || (req as any).args?.contactId;
+      const planId = (req as any).details?.plan_id || (req as any).args?.planId;
+      const cost = (req as any).details?.cost || 0;
+      const existingSub = globalMemoryStore.subscriptions.find((s) => s.contact_id === contactId);
+      if (existingSub) {
+        existingSub.plan_id = planId;
+        existingSub.mrr_cents = cost;
+        existingSub.status = "active";
+      } else {
+        globalMemoryStore.subscriptions.unshift({
+          id: `sub-${Date.now()}`,
+          workspace_id: workspaceId,
+          contact_id: contactId,
+          plan_id: planId,
+          status: "active",
+          mrr_cents: cost,
+          created_at: new Date().toISOString()
+        } as any);
+      }
+    }
+  }
+
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role: "admin",
+    tool: "Approval Gate",
+    risk: "high",
+    status: "executed",
+    args: { requestId, status, approver },
+    result: { message: `Approval request ${status}` }
+  } as any);
+
+  return req;
 }
 
 export async function listCampaigns(workspaceId: string = WS): Promise<Campaign[]> {
@@ -1778,29 +2095,40 @@ export async function createAuditLog(
 }
 
 export async function createApprovalRequest(
-    action: ApprovalRequest["action"],
-    args: Record<string, string>,
-    requestedBy: string,
-    workspaceId: string = WS
-  ): Promise<ApprovalRequest> {
-    const idempotencyKey = `${action}:${Object.values(args).join(":")}:${requestedBy}`;
-    const existing = globalMemoryStore.approvals.find(
-      (item) =>
-        item.workspace_id === workspaceId &&
-        item.status === "pending" &&
-        `${item.action}:${Object.values(item.args).join(":")}:${item.requested_by}` === idempotencyKey
-    );
-    if (existing) return existing;
+  action: string,
+  argsOrRequester: any,
+  requestedByOrArgs?: any,
+  workspaceId: string = WS
+): Promise<ApprovalRequest> {
+  let finalArgs: Record<string, any> = {};
+  let finalRequester = "admin@nexus.internal";
 
-    const approval: ApprovalRequest = {
-      id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      workspace_id: workspaceId,
-      action,
-      args,
-      requested_by: requestedBy,
-      status: "pending",
-      created_at: new Date().toISOString()
-    };
+  if (typeof argsOrRequester === "string") {
+    finalRequester = argsOrRequester;
+    finalArgs = requestedByOrArgs || {};
+  } else {
+    finalArgs = argsOrRequester || {};
+    finalRequester = typeof requestedByOrArgs === "string" ? requestedByOrArgs : "admin@nexus.internal";
+  }
+
+  const idempotencyKey = `${action}:${Object.values(finalArgs).join(":")}:${finalRequester}`;
+  const existing = globalMemoryStore.approvals.find(
+    (item) =>
+      item.workspace_id === workspaceId &&
+      item.status === "pending" &&
+      `${item.action}:${Object.values(item.args).join(":")}:${item.requested_by}` === idempotencyKey
+  );
+  if (existing) return existing;
+
+  const approval: ApprovalRequest = {
+    id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    workspace_id: workspaceId,
+    action,
+    args: finalArgs,
+    requested_by: finalRequester,
+    status: "pending",
+    created_at: new Date().toISOString()
+  };
     globalMemoryStore.approvals.unshift(approval);
     const supabase = await getSupabase();
     if (supabase) {
@@ -1808,19 +2136,19 @@ export async function createApprovalRequest(
         id: approval.id,
         workspace_id: workspaceId,
         tool: action,
-        args,
-        requested_by: requestedBy,
+        args: finalArgs,
+        requested_by: finalRequester,
         status: "pending"
       });
       if (error) throw new Error(`Unable to save approval request: ${error.message}`);
     }
     await createAuditLog({
       workspace_id: workspaceId,
-      role: requestedBy,
+      role: finalRequester,
       tool: `request_${action}`,
       risk: "high",
       status: "pending_approval",
-      args,
+      args: finalArgs,
       result: { approval_id: approval.id }
     });
     return approval;

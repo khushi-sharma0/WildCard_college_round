@@ -587,3 +587,79 @@ VALUES
     ('00000000-0000-0000-0000-000000000001', 'admin', 'create_plan', 'medium', 'executed', '{"name": "Retail Growth Pass", "price_cents": 4900, "interval": "monthly"}'::jsonb, '{"plan_id": "11111111-1111-1111-1111-111111111101"}'::jsonb, NOW() - INTERVAL '2 days'),
     ('00000000-0000-0000-0000-000000000001', 'admin', 'create_webinar', 'medium', 'executed', '{"title": "AI in Retail: Next-Gen Store Intelligence"}'::jsonb, '{"webinar_id": "44444444-4444-4444-4444-444444444401"}'::jsonb, NOW() - INTERVAL '1 days'),
     ('00000000-0000-0000-0000-000000000001', 'admin', 'send_campaign', 'high', 'executed', '{"campaign_id": "55555555-5555-5555-5555-555555555501"}'::jsonb, '{"sent_count": 21, "mode": "mailtrap_sandbox"}'::jsonb, NOW() - INTERVAL '1 days');
+
+-- ==============================================================================
+-- SAAS BILLING & MARKETING AUTOMATION EXTENSIONS
+-- ==============================================================================
+
+-- Plans Quota & Metering Attributes
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_websites INTEGER DEFAULT 1;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_contacts INTEGER DEFAULT 500;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_team_members INTEGER DEFAULT 2;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_webinars_per_month INTEGER DEFAULT 2;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS included_emails INTEGER DEFAULT 1000;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS email_overage_rate_cents INTEGER DEFAULT 50;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS included_ai_actions INTEGER DEFAULT 100;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS ai_overage_rate_cents INTEGER DEFAULT 10;
+
+-- Subscriptions Lifecycle Attributes
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_period_start TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days';
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN DEFAULT false;
+
+-- Campaigns Scheduling & Targeting
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS target_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS send_time TIMESTAMPTZ;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS created_by TEXT;
+
+-- Invoices Table
+CREATE TABLE IF NOT EXISTS invoices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    amount_due_cents INTEGER NOT NULL,
+    amount_paid_cents INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'open', -- 'open', 'paid', 'failed', 'void'
+    period_start TIMESTAMPTZ,
+    period_end TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    paid_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_workspace ON invoices(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_subscription ON invoices(subscription_id);
+
+-- Invoice Line Items Table
+CREATE TABLE IF NOT EXISTS invoice_line_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    type TEXT DEFAULT 'subscription', -- 'subscription', 'overage'
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_invoice_line_items_invoice ON invoice_line_items(invoice_id);
+
+-- Usage Events Table (Metered Tracking)
+CREATE TABLE IF NOT EXISTS usage_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    metric TEXT NOT NULL, -- 'emails_sent', 'ai_actions', 'webinar_seats'
+    quantity INTEGER NOT NULL DEFAULT 1,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_workspace ON usage_events(workspace_id);
+
+-- Campaign Engagement Table
+CREATE TABLE IF NOT EXISTS campaign_engagement (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    contact_id UUID NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'sent', -- 'sent', 'delivered', 'opened', 'clicked', 'failed'
+    opened_at TIMESTAMPTZ,
+    clicked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_engagement_campaign ON campaign_engagement(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_engagement_contact ON campaign_engagement(contact_id);
+

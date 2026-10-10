@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { contactId, planId } = body;
+    const { contactId, planId, workspaceId } = body;
 
     if (!contactId || !planId) {
       return NextResponse.json(
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const sub = await subscribeContact(contactId, planId);
+    const sub = await subscribeContact(contactId, planId, workspaceId, role);
     return NextResponse.json(sub);
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
