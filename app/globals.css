@@ -1,0 +1,60 @@
+@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..700;1,6..72,400..700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 23% 97%; /* #FAF8F5 */
+    --foreground: 24 10% 10%; /* #1C1917 */
+    --card: 0 0% 100%;
+    --card-foreground: 24 10% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 24 10% 10%;
+    --primary: 16 60% 49%; /* #C85A32 Terracotta */
+    --primary-foreground: 40 23% 97%;
+    --secondary: 40 15% 94%;
+    --secondary-foreground: 24 10% 10%;
+    --muted: 30 7% 93%;
+    --muted-foreground: 25 5% 45%; /* #78716C */
+    --accent: 16 60% 49%;
+    --accent-foreground: 40 23% 97%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 40 23% 97%;
+    --border: 30 7% 90%; /* #E7E5E4 */
+    --input: 30 5% 83%; /* #D6D3D1 */
+    --ring: 16 60% 49%;
+    --radius: 2px;
+  }
+}
+
+body {
+  background-color: #FAF8F5;
+  color: #1C1917;
+  font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Warm, crisp, tactile scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F4F0E8;
+}
+::-webkit-scrollbar-thumb {
+  background: #D6D3D1;
+  border-radius: 0px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A8A29E;
+}
+
+/* Selection */
+::selection {
+  background: #E8C2B3;
+  color: #1C1917;
+}
