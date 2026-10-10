@@ -1,5 +1,7 @@
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
+import { randomUUID } from "node:crypto";
+import { SiteBuilderSettings, SiteTheme } from "@/lib/site-themes";
 
 // Default workspace ID
 export const WS = process.env.DEMO_WORKSPACE_ID || "00000000-0000-0000-0000-000000000001";
@@ -30,9 +32,49 @@ export interface Page {
   title: string;
   slug: string;
   content: string;
+  gjs_data?: PageBlock[] | null;
+  builder_data?: SiteBuilderSettings | null;
+  theme_color?: string;
+  linked_webinar_id?: string | null;
   html?: string;
   css?: string;
   is_published: boolean;
+  created_at: string;
+}
+
+export type PageBlockType =
+  | "hero"
+  | "text"
+  | "image"
+  | "features"
+  | "gallery"
+  | "testimonials"
+  | "faq"
+  | "registration"
+  | "pricing"
+  | "cta"
+  | "footer";
+
+export interface PageBlock {
+  id: string;
+  type: PageBlockType;
+  content: string;
+  items?: string[];
+  target_id?: string;
+  variant?: string;
+  hidden?: boolean;
+  settings?: {
+    alignment?: "left" | "center" | "right";
+    contentWidth?: "narrow" | "standard" | "wide" | "full";
+    spacing?: "compact" | "normal" | "spacious";
+    background?: { kind: "solid" | "gradient" | "image"; value: string };
+    columnCount?: number;
+    mobileStack?: "image-above" | "image-below";
+  };
+}
+
+export interface SavedSiteTheme extends SiteTheme {
+  workspace_id: string;
   created_at: string;
 }
 
@@ -83,6 +125,7 @@ export interface Subscription {
 export interface Campaign {
   id: string;
   workspace_id: string;
+  idempotency_key?: string;
   segment_id?: string;
   subject: string;
   body: string;
@@ -122,6 +165,19 @@ export interface AgentRun {
   updated_at: string;
 }
 
+export type MutableRecordKind = "page" | "webinar" | "campaign" | "plan";
+export type MutableRecord = Page | Webinar | Campaign | Plan;
+export interface ApprovalRequest {
+  id: string;
+  workspace_id: string;
+  action: "subscribe_contact" | "send_campaign";
+  args: Record<string, string>;
+  requested_by: string;
+  status: "pending" | "approved" | "rejected";
+  reason?: string;
+  created_at: string;
+}
+
 // Global In-Memory Fallback Store (Ensures 100% functionality even when Supabase is not configured or in offline demo mode)
 class MemoryStore {
   contacts: Contact[] = [];
@@ -135,6 +191,8 @@ class MemoryStore {
   events: Array<{ id: string; workspace_id: string; event_type: string; payload: any; created_at: string }> = [];
   agent_runs: AgentRun[] = [];
   audit_logs: AuditLog[] = [];
+  approvals: ApprovalRequest[] = [];
+  site_themes: SavedSiteTheme[] = [];
 
   constructor() {
     this.seed();
@@ -334,17 +392,25 @@ class MemoryStore {
   }
 }
 
-// Global singleton for memory fallback across Next.js route chunks
-const globalMemoryStore: MemoryStore =
-  (globalThis as any).__nexusMemoryStore ||
-  ((globalThis as any).__nexusMemoryStore = new MemoryStore());
+// Preserve the development fallback across Next.js route bundles and hot reloads.
+type ServicesGlobal = typeof globalThis & {
+  __nexusMemoryStore?: MemoryStore;
+};
 
-function getSupabase(): SupabaseClient | null {
-  const url = process.env.SUPABASE_URL;
+const servicesGlobal = globalThis as ServicesGlobal;
+if (!servicesGlobal.__nexusMemoryStore) {
+  servicesGlobal.__nexusMemoryStore = new MemoryStore();
+}
+const globalMemoryStore = servicesGlobal.__nexusMemoryStore;
+
+async function getSupabase(): Promise<SupabaseClient | null> {
+  if (process.env.AUTH_MODE !== "supabase") return null;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key || url.includes("your-project") || key.includes("your_service_role_key")) {
     return null;
   }
+  const { createClient } = await import("@supabase/supabase-js");
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false }
   });
@@ -362,7 +428,7 @@ export async function track(
   payload: Record<string, any> = {},
   workspaceId: string = WS
 ): Promise<{ success: boolean }> {
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { error } = await supabase.from("events").insert({
@@ -387,10 +453,58 @@ export async function track(
   return { success: true };
 }
 
+export async function trackPageEvent(
+  eventType: "page_view" | "form_submitted",
+  payload: Record<string, unknown>,
+  workspaceId: string = WS
+): Promise<void> {
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { error } = await supabase.from("events").insert({
+      workspace_id: workspaceId,
+      event_type: eventType,
+      payload
+    });
+    if (error) throw new Error(`Unable to record ${eventType}: ${error.message}`);
+    return;
+  }
+
+  await track(eventType, payload, workspaceId);
+}
+
+export async function getPageEventCounts(
+  workspaceId: string = WS
+): Promise<Record<string, { views: number; submissions: number }>> {
+  const supabase = await getSupabase();
+  let events: Array<{ event_type: string; payload: Record<string, unknown> }> = [];
+  if (supabase) {
+    const { data, error } = await supabase.from("events")
+      .select("event_type,payload")
+      .eq("workspace_id", workspaceId)
+      .in("event_type", ["page_view", "form_submitted"]);
+    if (error) throw new Error(`Unable to load landing page activity: ${error.message}`);
+    events = (data || []) as typeof events;
+  } else {
+    events = globalMemoryStore.events
+      .filter((event) => event.workspace_id === workspaceId && (event.event_type === "page_view" || event.event_type === "form_submitted"))
+      .map(({ event_type, payload }) => ({ event_type, payload }));
+  }
+
+  return events.reduce<Record<string, { views: number; submissions: number }>>((counts, event) => {
+    const pageId = typeof event.payload?.page_id === "string" ? event.payload.page_id : "";
+    if (!pageId) return counts;
+    const count = counts[pageId] || { views: 0, submissions: 0 };
+    if (event.event_type === "page_view") count.views += 1;
+    if (event.event_type === "form_submitted") count.submissions += 1;
+    counts[pageId] = count;
+    return counts;
+  }, {});
+}
+
 /**
  * 2. QUERY ANALYTICS: Summary KPIs, Funnel, and Daily Trends
  */
-export async function queryAnalytics(workspaceId: string = WS) {
+export async function queryAnalytics(workspaceId: string = WS, rangeDays = 14) {
   const contacts = await listContacts(workspaceId);
   const webinars = await listWebinars(workspaceId);
   const campaigns = await listCampaigns(workspaceId);
@@ -407,35 +521,53 @@ export async function queryAnalytics(workspaceId: string = WS) {
     .filter((s) => s.status === "active")
     .reduce((sum, s) => sum + (s.mrr_cents || 0), 0);
 
-  // Calculate Webinar Stats
-  let totalRegistrations = 0;
-  let totalAttended = 0;
-  for (const w of webinars) {
-    const regs = await listRegistrations(w.id, workspaceId);
-    totalRegistrations += regs.length;
-    totalAttended += regs.filter((r) => r.attended).length;
-  }
+  const registrationsByWebinar = await Promise.all(
+    webinars.map((webinar) => listRegistrations(webinar.id, workspaceId))
+  );
+  const registrations = registrationsByWebinar.flat();
+  const totalRegistrations = registrations.length;
+  const totalAttended = registrations.filter((registration) => registration.attended).length;
 
-  // Campaign stats
   const emailsSent = campaigns.reduce((acc, c) => acc + (c.sent_count || 0), 0);
-
-  // Agent stats & hours saved (each executed action saves ~6 mins = 0.1 hr)
   const executedAgentActions = auditLogs.filter((a) => a.status === "executed").length;
   const estimatedHoursSaved = Number((executedAgentActions * 0.1).toFixed(1));
 
-  // Funnel data
-  const pageViews = 240 + contacts.length * 2;
+  const fromDate = new Date();
+  fromDate.setDate(fromDate.getDate() - Math.max(1, Math.min(30, rangeDays)) + 1);
+  fromDate.setHours(0, 0, 0, 0);
+  let events = globalMemoryStore.events.filter(
+    (event) =>
+      event.workspace_id === workspaceId &&
+      new Date(event.created_at).getTime() >= fromDate.getTime()
+  );
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("events")
+      .select("event_type,payload,created_at")
+      .eq("workspace_id", workspaceId)
+      .gte("created_at", fromDate.toISOString())
+      .order("created_at", { ascending: true });
+    if (error) throw new Error(`Unable to load analytics events: ${error.message}`);
+    if (data) events = data as typeof events;
+  }
+  const pageViews = events.filter((event) => event.event_type === "page_view").length;
+  const visitorsToRegistrants = pageViews
+    ? Number(((totalRegistrations / pageViews) * 100).toFixed(1))
+    : 0;
+  const webinarAttendanceRate = totalRegistrations
+    ? Number(((totalAttended / totalRegistrations) * 100).toFixed(1))
+    : 0;
   const funnel = [
     { stage: "Page Views", count: pageViews },
     { stage: "Leads Created", count: contacts.length },
-    { stage: "Webinar Registrations", count: totalRegistrations || 12 },
-    { stage: "Emails Sent", count: emailsSent || 22 },
-    { stage: "Customers (Subscribed)", count: customersCount || 5 }
+    { stage: "Webinar Registrations", count: totalRegistrations },
+    { stage: "Emails Sent", count: emailsSent },
+    { stage: "Customers (Subscribed)", count: customersCount }
   ];
 
-  // Daily events breakdown for line chart
   const daysMap: Record<string, { date: string; views: number; leads: number; registrations: number; emails: number }> = {};
-  for (let i = 13; i >= 0; i--) {
+  for (let i = Math.max(1, Math.min(30, rangeDays)) - 1; i >= 0; i--) {
     const d = new Date(Date.now() - i * 86400000);
     const key = d.toISOString().split("T")[0];
     daysMap[key] = {
@@ -447,8 +579,6 @@ export async function queryAnalytics(workspaceId: string = WS) {
     };
   }
 
-  // Populate from memory/supabase events
-  const events = globalMemoryStore.events.filter((e) => e.workspace_id === workspaceId);
   for (const evt of events) {
     const key = evt.created_at.split("T")[0];
     if (daysMap[key]) {
@@ -468,8 +598,13 @@ export async function queryAnalytics(workspaceId: string = WS) {
       customersCount,
       mrrCents,
       pageViews,
-      totalRegistrations: totalRegistrations || 12,
-      emailsSent: emailsSent || 22,
+      totalRegistrations,
+      totalAttended,
+      webinarAttendanceRate,
+      visitorsToRegistrants,
+      emailsSent,
+      activeSubscriptions: subscriptions.filter((subscription) => subscription.status === "active").length,
+      conversionRate: totalContacts ? Number(((customersCount / totalContacts) * 100).toFixed(1)) : 0,
       executedAgentActions,
       estimatedHoursSaved
     },
@@ -487,7 +622,12 @@ export async function createSegment(
   workspaceId: string = WS
 ): Promise<Segment> {
   const cleanTag = filter_tag.trim().toLowerCase();
-  const supabase = getSupabase();
+  const existing = (await listSegments(workspaceId)).find(
+    (segment) => segment.filter_tag.trim().toLowerCase() === cleanTag
+  );
+  if (existing) return existing;
+
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase
@@ -529,44 +669,74 @@ export async function createPage(
   content: string,
   html?: string,
   css?: string,
-  workspaceId: string = WS
+  workspaceId: string = WS,
+  reuseExistingSlug: boolean = false,
+  builder?: {
+    gjs_data?: PageBlock[];
+    builder_data?: SiteBuilderSettings;
+    theme_color?: string;
+    linked_webinar_id?: string | null;
+    is_published?: boolean;
+  }
 ): Promise<Page> {
   const cleanSlug = slug
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/^-+|-+$/g, "");
 
+  const existingPage = (await listPages(workspaceId)).find(
+    (page) => page.slug.toLowerCase() === cleanSlug
+  );
+  if (existingPage) {
+    if (existingPage.title === title && existingPage.content === content) {
+      return existingPage;
+    }
+    if (reuseExistingSlug) return existingPage;
+    throw new Error(`The page slug "${cleanSlug}" is already in use.`);
+  }
+
+  const escapeHtml = (value: string) =>
+    value.replace(/[&<>"']/g, (character) => {
+      const entities: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      };
+      return entities[character] || character;
+    });
   const generatedHtml =
     html ||
     `<div class="max-w-3xl mx-auto py-12 px-6 text-slate-100">
       <div class="inline-block px-3 py-1 bg-indigo-500/20 text-indigo-400 rounded-full text-xs font-semibold uppercase tracking-wider mb-4 border border-indigo-500/30">Official Executive Webinar</div>
-      <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent mb-6">${title}</h1>
-      <p class="text-lg text-slate-300 leading-relaxed mb-8">${content}</p>
+      <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent mb-6">${escapeHtml(title)}</h1>
+      <p class="text-lg text-slate-300 leading-relaxed mb-8">${escapeHtml(content)}</p>
     </div>`;
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from("pages")
-        .insert({
-          workspace_id: workspaceId,
-          title,
-          slug: cleanSlug,
-          content,
-          html: generatedHtml,
-          css: css || "",
-          is_published: true
-        })
-        .select()
-        .single();
-      if (!error && data) {
-        await track("page_created", { page_id: data.id, slug: cleanSlug }, workspaceId);
-        return data;
-      }
-    } catch (err) {
-      console.warn("Supabase createPage fallback", err);
-    }
+    const { data, error } = await supabase
+      .from("pages")
+      .insert({
+        workspace_id: workspaceId,
+        title,
+        slug: cleanSlug,
+        content,
+        html: generatedHtml,
+        css: css || "",
+        gjs_data: builder?.gjs_data || null,
+        builder_data: builder?.builder_data || null,
+        theme_color: builder?.theme_color || "#C85A32",
+        linked_webinar_id: builder?.linked_webinar_id || null,
+        is_published: builder?.is_published ?? true
+      })
+      .select()
+      .single();
+    if (error) throw new Error(`Unable to create landing page: ${error.message}`);
+    if (!data) throw new Error("Unable to create landing page: the database returned no record.");
+    await track("page_created", { page_id: data.id, slug: cleanSlug }, workspaceId);
+    return data as Page;
   }
 
   const newPage: Page = {
@@ -575,9 +745,13 @@ export async function createPage(
     title,
     slug: cleanSlug,
     content,
+    gjs_data: builder?.gjs_data,
+    builder_data: builder?.builder_data,
+    theme_color: builder?.theme_color || "#C85A32",
+    linked_webinar_id: builder?.linked_webinar_id || null,
     html: generatedHtml,
     css: css || "",
-    is_published: true,
+    is_published: builder?.is_published ?? true,
     created_at: new Date().toISOString()
   };
   // remove any duplicate slug in fallback
@@ -599,6 +773,14 @@ export async function createWebinar(
   plan_id?: string,
   workspaceId: string = WS
 ): Promise<Webinar> {
+  const normalizedDate = new Date(scheduled_at).toISOString();
+  const existingWebinar = (await listWebinars(workspaceId)).find(
+    (webinar) =>
+      webinar.title.trim().toLowerCase() === title.trim().toLowerCase() &&
+      new Date(webinar.scheduled_at).toISOString() === normalizedDate
+  );
+  if (existingWebinar) return existingWebinar;
+
   const roomClean = title
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "-")
@@ -606,7 +788,7 @@ export async function createWebinar(
     .substring(0, 32);
   const jitsi_room = `nexus-${roomClean}-${Date.now().toString(36)}`;
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase
@@ -614,7 +796,7 @@ export async function createWebinar(
         .insert({
           workspace_id: workspaceId,
           title,
-          scheduled_at: new Date(scheduled_at).toISOString(),
+          scheduled_at: normalizedDate,
           jitsi_room,
           landing_page_id: landing_page_id || null,
           plan_id: plan_id || null
@@ -634,7 +816,7 @@ export async function createWebinar(
     id: `webinar-${Date.now()}`,
     workspace_id: workspaceId,
     title,
-    scheduled_at: new Date(scheduled_at).toISOString(),
+    scheduled_at: normalizedDate,
     jitsi_room,
     landing_page_id,
     plan_id,
@@ -655,7 +837,15 @@ export async function createPlan(
   description: string = "",
   workspaceId: string = WS
 ): Promise<Plan> {
-  const supabase = getSupabase();
+  const existingPlan = (await listPlans(workspaceId)).find(
+    (plan) =>
+      plan.name.trim().toLowerCase() === name.trim().toLowerCase() &&
+      plan.price_cents === price_cents &&
+      plan.interval === interval
+  );
+  if (existingPlan) return existingPlan;
+
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase
@@ -699,15 +889,27 @@ export async function draftCampaign(
   segment_id: string,
   subject: string,
   body: string,
-  workspaceId: string = WS
+  workspaceId: string = WS,
+  idempotencyKey?: string
 ): Promise<Campaign> {
-  const supabase = getSupabase();
+  const existingCampaign = (await listCampaigns(workspaceId)).find(
+    (campaign) =>
+      (idempotencyKey && campaign.idempotency_key === idempotencyKey) ||
+      (campaign.status === "draft" &&
+        campaign.segment_id === (segment_id || undefined) &&
+        campaign.subject === subject &&
+        campaign.body === body)
+  );
+  if (existingCampaign) return existingCampaign;
+
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase
         .from("campaigns")
         .insert({
           workspace_id: workspaceId,
+          idempotency_key: idempotencyKey || null,
           segment_id: segment_id || null,
           subject,
           body,
@@ -728,6 +930,7 @@ export async function draftCampaign(
   const newCampaign: Campaign = {
     id: `camp-${Date.now()}`,
     workspace_id: workspaceId,
+    idempotency_key: idempotencyKey,
     segment_id,
     subject,
     body,
@@ -753,6 +956,20 @@ export async function sendCampaign(
   if (!campaign) {
     throw new Error(`Campaign ${campaign_id} not found`);
   }
+  const storedCampaign = globalMemoryStore.campaigns.find((item) => item.id === campaign_id);
+  const currentStatus = storedCampaign?.status || campaign.status;
+  if (currentStatus === "sent") {
+    return {
+      success: true,
+      sent_count: campaign.sent_count,
+      recipients: [],
+      note: "This campaign was already sent; duplicate delivery was prevented."
+    };
+  }
+  if (currentStatus === "sending") {
+    throw new Error("This campaign is already being sent.");
+  }
+  if (storedCampaign) storedCampaign.status = "sending";
 
   // Get segment and recipient contacts
   const segments = await listSegments(workspaceId);
@@ -809,7 +1026,7 @@ export async function sendCampaign(
   }
 
   // Update campaign status
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       await supabase
@@ -864,101 +1081,132 @@ export async function submitForm(params: {
 
   // 1. Find landing page
   const pages = await listPages(ws);
-  const page = pages.find((p) => p.slug === slug);
+  const page = pages.find((p) => p.slug === slug && p.is_published);
   if (!page) {
-    throw new Error(`Landing page with slug "${slug}" not found`);
+    throw new Error(`Published landing page with slug "${slug}" not found`);
+  }
+  if (Array.isArray(page.gjs_data) && !page.gjs_data.some((block) => block.type === "registration")) {
+    throw new Error("This published page does not currently accept registrations.");
   }
 
   // 2. Find or create CRM Contact
-  const contacts = await listContacts(ws);
-  let contact = contacts.find((c) => c.email.toLowerCase() === email.toLowerCase());
-
-  const initialTags = tag ? [tag.toLowerCase()] : ["retail", "inbound"];
+  let contact: Contact | undefined;
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase.from("contacts")
+      .select("*")
+      .eq("workspace_id", ws)
+      .ilike("email", email)
+      .maybeSingle();
+    if (error) throw new Error(`Unable to look up registration contact: ${error.message}`);
+    if (data) contact = data as Contact;
+  } else {
+    contact = (await listContacts(ws)).find((c) => c.email.toLowerCase() === email.toLowerCase());
+  }
 
   if (!contact) {
     contact = {
-      id: `cont-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      id: randomUUID(),
       workspace_id: ws,
       name,
       email,
-      tags: initialTags,
-      source: `landing_page:${slug}`,
+      tags: tag ? [tag.toLowerCase()] : [],
+      source: `landing_page:${page.title} (/s/${page.slug})`,
       status: "lead",
       created_at: new Date().toISOString()
     };
-    globalMemoryStore.contacts.unshift(contact);
-
-    const supabase = getSupabase();
     if (supabase) {
-      try {
-        await supabase.from("contacts").insert({
-          id: contact.id,
-          workspace_id: ws,
-          name,
-          email,
-          tags: contact.tags,
-          source: contact.source,
-          status: "lead"
-        });
-      } catch (e) {
-        console.warn("Supabase contact insert fallback", e);
+      const { data, error } = await supabase.from("contacts").insert(contact).select().single();
+      if (error) {
+        if (error.code === "23505") {
+          const { data: existing, error: lookupError } = await supabase.from("contacts")
+            .select("*")
+            .eq("workspace_id", ws)
+            .ilike("email", email)
+            .single();
+          if (lookupError || !existing) {
+            throw new Error(`Unable to resolve existing registration contact: ${lookupError?.message || error.message}`);
+          }
+          contact = existing as Contact;
+        } else {
+          throw new Error(`Unable to create registration contact: ${error.message}`);
+        }
+      } else if (data) {
+        contact = data as Contact;
       }
+    } else {
+      globalMemoryStore.contacts.unshift(contact);
     }
     await track("lead_created", { contact_id: contact.id, email, slug }, ws);
   } else {
-    // Merge tag
+    // Merge the optional interest tag on an existing contact.
     if (tag && !contact.tags.includes(tag.toLowerCase())) {
       contact.tags.push(tag.toLowerCase());
+      if (supabase) {
+        const { error } = await supabase.from("contacts").update({ tags: contact.tags }).eq("id", contact.id);
+        if (error) throw new Error(`Unable to update registration contact: ${error.message}`);
+      }
     }
   }
 
-  // 3. Check for linked webinar
+  // 3. Register only for the webinar explicitly linked to this page.
   const webinars = await listWebinars(ws);
-  const webinar = webinars.find((w) => w.landing_page_id === page.id) || webinars[0];
+  const webinar = webinars.find((w) => w.id === page.linked_webinar_id)
+    || webinars.find((w) => w.landing_page_id === page.id);
 
   let webinarId: string | undefined = undefined;
   if (webinar) {
     webinarId = webinar.id;
-    // Register contact
-    const existingReg = globalMemoryStore.registrations.find(
-      (r) => r.webinar_id === webinar.id && r.contact_id === contact.id
-    );
+    let existingReg: Registration | undefined;
+    if (supabase) {
+      const { data, error } = await supabase.from("registrations")
+        .select("id")
+        .eq("webinar_id", webinar.id)
+        .eq("contact_id", contact.id)
+        .maybeSingle();
+      if (error) throw new Error(`Unable to check webinar registration: ${error.message}`);
+      if (data) existingReg = data as Registration;
+    } else {
+      existingReg = globalMemoryStore.registrations.find(
+        (r) => r.webinar_id === webinar.id && r.contact_id === contact.id
+      );
+    }
     if (!existingReg) {
       const reg: Registration = {
-        id: `reg-${Date.now()}`,
+        id: randomUUID(),
         workspace_id: ws,
         webinar_id: webinar.id,
         contact_id: contact.id,
         attended: false,
         created_at: new Date().toISOString()
       };
-      globalMemoryStore.registrations.unshift(reg);
-
-      const supabase = getSupabase();
       if (supabase) {
-        try {
-          await supabase.from("registrations").insert({
-            id: reg.id,
-            workspace_id: ws,
-            webinar_id: webinar.id,
-            contact_id: contact.id,
-            attended: false
-          });
-        } catch (e) {
-          console.warn("Supabase registration insert fallback", e);
+        const { error } = await supabase.from("registrations").insert(reg);
+        if (error && error.code !== "23505") {
+          throw new Error(`Unable to register for webinar: ${error.message}`);
         }
+        if (!error) await track("webinar_registered", { webinar_id: webinar.id, contact_id: contact.id }, ws);
+      } else {
+        globalMemoryStore.registrations.unshift(reg);
+        await track("webinar_registered", { webinar_id: webinar.id, contact_id: contact.id }, ws);
       }
-      await track("webinar_registered", { webinar_id: webinar.id, contact_id: contact.id }, ws);
     }
   }
 
-  await track("page_view", { slug, email }, ws);
+  await trackPageEvent("form_submitted", {
+    page_id: page.id,
+    slug,
+    contact_id: contact.id,
+    webinar_id: webinarId
+  }, ws);
 
   return {
     success: true,
     contact_id: contact.id,
     webinar_id: webinarId,
-    message: "Registration successful! You have secured your VIP access."
+    message: webinarId
+      ? "Registration successful! Your webinar seat is reserved."
+      : "Your details were sent to the page owner."
   };
 }
 
@@ -973,7 +1221,7 @@ export async function listContacts(
 ): Promise<Contact[]> {
   let results = globalMemoryStore.contacts.filter((c) => c.workspace_id === workspaceId);
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       let query = supabase.from("contacts").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
@@ -997,8 +1245,98 @@ export async function listContacts(
   return results;
 }
 
+export async function createContact(
+  input: Pick<Contact, "name" | "email"> & { tags?: string[]; source?: string },
+  role: string,
+  workspaceId: string = WS
+): Promise<Contact> {
+  const email = input.email.trim().toLowerCase();
+  const existing = (await listContacts(workspaceId)).find(
+    (contact) => contact.email.toLowerCase() === email
+  );
+  if (existing) throw new Error("A contact with this email already exists.");
+
+  const contact: Contact = {
+    id: `cont-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    workspace_id: workspaceId,
+    name: input.name.trim(),
+    email,
+    tags: Array.from(new Set((input.tags || []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))),
+    source: input.source || "manual",
+    status: "lead",
+    created_at: new Date().toISOString()
+  };
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("contacts")
+      .insert(contact)
+      .select()
+      .single();
+    if (error) throw new Error(`Unable to create contact: ${error.message}`);
+    if (data) Object.assign(contact, data);
+  }
+  globalMemoryStore.contacts.unshift(contact);
+  await track("lead_created", { contact_id: contact.id, source: contact.source }, workspaceId);
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role,
+    tool: "create_contact",
+    risk: "low",
+    status: "executed",
+    args: { email },
+    result: { contact_id: contact.id }
+  });
+  return contact;
+}
+
+export async function updateContact(
+  contactId: string,
+  updates: Partial<Pick<Contact, "name" | "email" | "tags" | "status">>,
+  role: string,
+  workspaceId: string = WS
+): Promise<Contact> {
+  const contact = (await listContacts(workspaceId)).find((item) => item.id === contactId);
+  if (!contact) throw new Error("Contact not found.");
+  const cleanedUpdates = {
+    ...updates,
+    ...(updates.name ? { name: updates.name.trim() } : {}),
+    ...(updates.email ? { email: updates.email.trim().toLowerCase() } : {}),
+    ...(updates.tags ? { tags: Array.from(new Set(updates.tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean))) } : {})
+  };
+  if (cleanedUpdates.email && cleanedUpdates.email !== contact.email) {
+    const duplicate = (await listContacts(workspaceId)).some(
+      (item) => item.id !== contactId && item.email.toLowerCase() === cleanedUpdates.email
+    );
+    if (duplicate) throw new Error("A contact with this email already exists.");
+  }
+
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { error } = await supabase
+      .from("contacts")
+      .update(cleanedUpdates)
+      .eq("workspace_id", workspaceId)
+      .eq("id", contactId);
+    if (error) throw new Error(`Unable to update contact: ${error.message}`);
+  }
+  Object.assign(contact, cleanedUpdates);
+  const memoryContact = globalMemoryStore.contacts.find((item) => item.id === contactId);
+  if (memoryContact) Object.assign(memoryContact, cleanedUpdates);
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role,
+    tool: "update_contact",
+    risk: "low",
+    status: "executed",
+    args: { contact_id: contactId, fields: Object.keys(cleanedUpdates) },
+    result: { status: contact.status }
+  });
+  return contact;
+}
+
 export async function listSegments(workspaceId: string = WS): Promise<Segment[]> {
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase.from("segments").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
@@ -1009,20 +1347,57 @@ export async function listSegments(workspaceId: string = WS): Promise<Segment[]>
 }
 
 export async function listPages(workspaceId: string = WS): Promise<Page[]> {
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
-    try {
-      const { data, error } = await supabase.from("pages").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
-      if (!error && data && data.length > 0) return data;
-    } catch (e) {}
+    const { data, error } = await supabase.from("pages").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
+    if (error) throw new Error(`Unable to load landing pages: ${error.message}`);
+    return (data || []) as Page[];
   }
   return globalMemoryStore.pages.filter((p) => p.workspace_id === workspaceId);
+}
+
+export async function getWorkspaceName(workspaceId: string = WS): Promise<string> {
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase.from("workspaces").select("name").eq("id", workspaceId).maybeSingle();
+    if (error) throw new Error(`Unable to load workspace name: ${error.message}`);
+    if (data?.name) return data.name;
+  }
+  return "Nexus Demo Workspace";
+}
+
+export async function listSiteThemes(workspaceId: string = WS): Promise<SavedSiteTheme[]> {
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase.from("site_themes").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
+    if (error) throw new Error(`Unable to load saved themes: ${error.message}`);
+    return (data || []).map((row) => ({ ...row.theme_data, workspace_id: row.workspace_id, created_at: row.created_at })) as SavedSiteTheme[];
+  }
+  return globalMemoryStore.site_themes.filter((theme) => theme.workspace_id === workspaceId);
+}
+
+export async function saveSiteTheme(theme: SiteTheme, workspaceId: string = WS): Promise<SavedSiteTheme> {
+  const supabase = await getSupabase();
+  const saved: SavedSiteTheme = { ...theme, id: randomUUID(), name: "My Theme", workspace_id: workspaceId, created_at: new Date().toISOString() };
+  if (supabase) {
+    const { data, error } = await supabase.from("site_themes")
+      .upsert({ workspace_id: workspaceId, name: "My Theme", theme_data: theme }, { onConflict: "workspace_id,name" })
+      .select()
+      .single();
+    if (error) throw new Error(`Unable to save theme: ${error.message}`);
+    if (!data) throw new Error("Unable to save theme: the database returned no record.");
+    return { ...data.theme_data, workspace_id: data.workspace_id, created_at: data.created_at } as SavedSiteTheme;
+  }
+  const index = globalMemoryStore.site_themes.findIndex((item) => item.workspace_id === workspaceId && item.name === "My Theme");
+  if (index >= 0) globalMemoryStore.site_themes[index] = saved;
+  else globalMemoryStore.site_themes.unshift(saved);
+  return saved;
 }
 
 export async function listWebinars(workspaceId: string = WS): Promise<Webinar[]> {
   let list = globalMemoryStore.webinars.filter((w) => w.workspace_id === workspaceId);
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase.from("webinars").select("*").eq("workspace_id", workspaceId).order("scheduled_at", { ascending: true });
@@ -1040,10 +1415,22 @@ export async function listWebinars(workspaceId: string = WS): Promise<Webinar[]>
 }
 
 export async function listRegistrations(webinarId: string, workspaceId: string = WS): Promise<Registration[]> {
-  const regs = globalMemoryStore.registrations.filter((r) => r.webinar_id === webinarId && r.workspace_id === workspaceId);
+  let regs = globalMemoryStore.registrations.filter((r) => r.webinar_id === webinarId && r.workspace_id === workspaceId);
+  const supabase = await getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("registrations")
+      .select("*")
+      .eq("workspace_id", workspaceId)
+      .eq("webinar_id", webinarId)
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(`Unable to load webinar registrations: ${error.message}`);
+    if (data) regs = data;
+  }
+  const contacts = await listContacts(workspaceId);
   return regs.map((r) => ({
     ...r,
-    contact: globalMemoryStore.contacts.find((c) => c.id === r.contact_id)
+    contact: contacts.find((c) => c.id === r.contact_id)
   }));
 }
 
@@ -1052,7 +1439,7 @@ export async function toggleRegistrationAttended(registrationId: string, attende
   if (reg) {
     reg.attended = attended;
   }
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       await supabase.from("registrations").update({ attended }).eq("id", registrationId);
@@ -1062,7 +1449,7 @@ export async function toggleRegistrationAttended(registrationId: string, attende
 }
 
 export async function listPlans(workspaceId: string = WS): Promise<Plan[]> {
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       const { data, error } = await supabase.from("plans").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
@@ -1073,10 +1460,27 @@ export async function listPlans(workspaceId: string = WS): Promise<Plan[]> {
 }
 
 export async function listSubscriptions(workspaceId: string = WS): Promise<Subscription[]> {
-  const subs = globalMemoryStore.subscriptions.filter((s) => s.workspace_id === workspaceId);
+  let subs = globalMemoryStore.subscriptions.filter((s) => s.workspace_id === workspaceId);
+  const supabase = await getSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from("subscriptions")
+        .select("*")
+        .eq("workspace_id", workspaceId)
+        .order("created_at", { ascending: false });
+      if (!error && data && data.length > 0) subs = data;
+    } catch (error) {
+      console.warn("Supabase listSubscriptions fallback", error);
+    }
+  }
+  const [contacts, plans] = await Promise.all([
+    listContacts(workspaceId),
+    listPlans(workspaceId)
+  ]);
   return subs.map((s) => {
-    const contact = globalMemoryStore.contacts.find((c) => c.id === s.contact_id);
-    const plan = globalMemoryStore.plans.find((p) => p.id === s.plan_id);
+    const contact = contacts.find((c) => c.id === s.contact_id);
+    const plan = plans.find((p) => p.id === s.plan_id);
     return {
       ...s,
       contact_name: contact?.name || "Anonymous Contact",
@@ -1090,6 +1494,14 @@ export async function subscribeContact(
   planId: string,
   workspaceId: string = WS
 ): Promise<Subscription> {
+  const existingSubscription = (await listSubscriptions(workspaceId)).find(
+    (subscription) =>
+      subscription.contact_id === contactId &&
+      subscription.plan_id === planId &&
+      subscription.status === "active"
+  );
+  if (existingSubscription) return existingSubscription;
+
   const plan = (await listPlans(workspaceId)).find((p) => p.id === planId);
   if (!plan) throw new Error("Plan not found");
 
@@ -1108,7 +1520,7 @@ export async function subscribeContact(
   const contact = globalMemoryStore.contacts.find((c) => c.id === contactId);
   if (contact) contact.status = "customer";
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       await supabase.from("subscriptions").insert({
@@ -1128,13 +1540,187 @@ export async function subscribeContact(
 }
 
 export async function listCampaigns(workspaceId: string = WS): Promise<Campaign[]> {
-  const campaigns = globalMemoryStore.campaigns.filter((c) => c.workspace_id === workspaceId);
+  let campaigns = globalMemoryStore.campaigns.filter((c) => c.workspace_id === workspaceId);
+  const supabase = await getSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from("campaigns")
+        .select("*")
+        .eq("workspace_id", workspaceId)
+        .order("created_at", { ascending: false });
+      if (!error && data && data.length > 0) campaigns = data;
+    } catch (error) {
+      console.warn("Supabase listCampaigns fallback", error);
+    }
+  }
+  const segments = await listSegments(workspaceId);
   return campaigns.map((c) => {
-    const segment = globalMemoryStore.segments.find((s) => s.id === c.segment_id);
+    const segment = segments.find((s) => s.id === c.segment_id);
     return {
       ...c,
-      segment_name: segment?.name || "All Contacts"
+      segment_name: c.segment_name || segment?.name || "All Contacts"
     };
+  });
+}
+
+export async function updateRecord(
+  kind: MutableRecordKind,
+  id: string,
+  updates: Record<string, unknown>,
+  role: string,
+  workspaceId: string = WS
+): Promise<MutableRecord> {
+  const tableByKind = {
+    page: "pages",
+    webinar: "webinars",
+    campaign: "campaigns",
+    plan: "plans"
+  } as const;
+  const supabase = await getSupabase();
+
+  let record: MutableRecord | undefined;
+  switch (kind) {
+    case "page":
+      record = (await listPages(workspaceId)).find((item) => item.id === id);
+      break;
+    case "webinar":
+      record = (await listWebinars(workspaceId)).find((item) => item.id === id);
+      break;
+    case "campaign":
+      record = (await listCampaigns(workspaceId)).find((item) => item.id === id);
+      break;
+    case "plan":
+      record = (await listPlans(workspaceId)).find((item) => item.id === id);
+      break;
+  }
+  if (!record) throw new Error(`${kind} not found.`);
+  if (kind === "campaign" && (record as Campaign).status !== "draft") {
+    throw new Error("Only draft campaigns can be edited.");
+  }
+
+  if (kind === "page" && typeof updates.slug === "string") {
+    const duplicate = (await listPages(workspaceId)).some(
+      (page) => page.id !== id && page.slug === updates.slug
+    );
+    if (duplicate) throw new Error(`The page slug "${updates.slug}" is already in use.`);
+  }
+  if (kind === "webinar" && typeof updates.title === "string" && typeof updates.scheduled_at === "string") {
+    const duplicate = (await listWebinars(workspaceId)).some(
+      (webinar) =>
+        webinar.id !== id &&
+        webinar.title.trim().toLowerCase() === updates.title?.toString().trim().toLowerCase() &&
+        new Date(webinar.scheduled_at).getTime() === new Date(updates.scheduled_at as string).getTime()
+    );
+    if (duplicate) throw new Error("A webinar with this title and schedule already exists.");
+  }
+
+  if (supabase) {
+    const { error } = await supabase
+      .from(tableByKind[kind])
+      .update(updates)
+      .eq("workspace_id", workspaceId)
+      .eq("id", id);
+    if (error) throw new Error(`Unable to update ${kind}: ${error.message}`);
+  }
+
+  Object.assign(record, updates, { updated_at: new Date().toISOString() });
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role,
+    tool: `update_${kind}`,
+    risk: "medium",
+    status: "executed",
+    args: { id, updates },
+    result: { entity: kind, id }
+  });
+  return record;
+}
+
+export async function deleteRecord(
+  kind: MutableRecordKind,
+  id: string,
+  role: string,
+  workspaceId: string = WS
+): Promise<void> {
+  const tableByKind = {
+    page: "pages",
+    webinar: "webinars",
+    campaign: "campaigns",
+    plan: "plans"
+  } as const;
+  const supabase = await getSupabase();
+  const exists = kind === "page"
+    ? (await listPages(workspaceId)).some((item) => item.id === id)
+    : kind === "webinar"
+    ? (await listWebinars(workspaceId)).some((item) => item.id === id)
+    : kind === "campaign"
+    ? (await listCampaigns(workspaceId)).some((item) => item.id === id)
+    : (await listPlans(workspaceId)).some((item) => item.id === id);
+  if (!exists) throw new Error(`${kind} not found.`);
+
+  if (supabase) {
+    const { error } = await supabase
+      .from(tableByKind[kind])
+      .delete()
+      .eq("workspace_id", workspaceId)
+      .eq("id", id);
+    if (error) throw new Error(`Unable to delete ${kind}: ${error.message}`);
+  }
+
+  let removed = true;
+  switch (kind) {
+    case "page": {
+      const index = globalMemoryStore.pages.findIndex((item) => item.id === id && item.workspace_id === workspaceId);
+      if (index !== -1) {
+        globalMemoryStore.pages.splice(index, 1);
+        for (const webinar of globalMemoryStore.webinars) {
+          if (webinar.landing_page_id === id) webinar.landing_page_id = undefined;
+        }
+        removed = true;
+      }
+      break;
+    }
+    case "webinar": {
+      const index = globalMemoryStore.webinars.findIndex((item) => item.id === id && item.workspace_id === workspaceId);
+      if (index !== -1) {
+        globalMemoryStore.webinars.splice(index, 1);
+        globalMemoryStore.registrations = globalMemoryStore.registrations.filter((item) => item.webinar_id !== id);
+        removed = true;
+      }
+      break;
+    }
+    case "campaign": {
+      const index = globalMemoryStore.campaigns.findIndex((item) => item.id === id && item.workspace_id === workspaceId);
+      if (index !== -1) {
+        globalMemoryStore.campaigns.splice(index, 1);
+        removed = true;
+      }
+      break;
+    }
+    case "plan": {
+      const index = globalMemoryStore.plans.findIndex((item) => item.id === id && item.workspace_id === workspaceId);
+      if (index !== -1) {
+        globalMemoryStore.plans.splice(index, 1);
+        globalMemoryStore.subscriptions = globalMemoryStore.subscriptions.filter((item) => item.plan_id !== id);
+        for (const webinar of globalMemoryStore.webinars) {
+          if (webinar.plan_id === id) webinar.plan_id = undefined;
+        }
+        removed = true;
+      }
+      break;
+    }
+  }
+  if (!removed) throw new Error(`${kind} not found.`);
+
+  await createAuditLog({
+    workspace_id: workspaceId,
+    role,
+    tool: `delete_${kind}`,
+    risk: "medium",
+    status: "executed",
+    args: { id },
+    result: { entity: kind, id, deleted: true }
   });
 }
 
@@ -1145,7 +1731,7 @@ export async function listAuditLogs(
 ): Promise<AuditLog[]> {
   let logs = globalMemoryStore.audit_logs.filter((a) => a.workspace_id === workspaceId);
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       let q = supabase.from("audit_logs").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
@@ -1164,21 +1750,154 @@ export async function listAuditLogs(
 export async function createAuditLog(
   log: Omit<AuditLog, "id" | "created_at">
 ): Promise<AuditLog> {
+  const { getOptionalIdentity } = await import("@/lib/auth");
+  const identity = await getOptionalIdentity();
   const newLog: AuditLog = {
-    id: `audit-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    id: randomUUID(),
     ...log,
+    args: identity
+      ? {
+          ...log.args,
+          actor_id: identity.userId,
+          actor_email: identity.email,
+          real_role: identity.realRole,
+          effective_role: identity.role,
+          impersonating: identity.isImpersonating
+        }
+      : log.args,
     created_at: new Date().toISOString()
   };
   globalMemoryStore.audit_logs.unshift(newLog);
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
-    try {
-      await supabase.from("audit_logs").insert(newLog);
-    } catch (e) {}
+    const { error } = await supabase.from("audit_logs").insert(newLog);
+    if (error) throw new Error(`Unable to persist audit log: ${error.message}`);
+  }
+  return newLog;
+}
+
+export async function createApprovalRequest(
+    action: ApprovalRequest["action"],
+    args: Record<string, string>,
+    requestedBy: string,
+    workspaceId: string = WS
+  ): Promise<ApprovalRequest> {
+    const idempotencyKey = `${action}:${Object.values(args).join(":")}:${requestedBy}`;
+    const existing = globalMemoryStore.approvals.find(
+      (item) =>
+        item.workspace_id === workspaceId &&
+        item.status === "pending" &&
+        `${item.action}:${Object.values(item.args).join(":")}:${item.requested_by}` === idempotencyKey
+    );
+    if (existing) return existing;
+
+    const approval: ApprovalRequest = {
+      id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      workspace_id: workspaceId,
+      action,
+      args,
+      requested_by: requestedBy,
+      status: "pending",
+      created_at: new Date().toISOString()
+    };
+    globalMemoryStore.approvals.unshift(approval);
+    const supabase = await getSupabase();
+    if (supabase) {
+      const { error } = await supabase.from("approvals").insert({
+        id: approval.id,
+        workspace_id: workspaceId,
+        tool: action,
+        args,
+        requested_by: requestedBy,
+        status: "pending"
+      });
+      if (error) throw new Error(`Unable to save approval request: ${error.message}`);
+    }
+    await createAuditLog({
+      workspace_id: workspaceId,
+      role: requestedBy,
+      tool: `request_${action}`,
+      risk: "high",
+      status: "pending_approval",
+      args,
+      result: { approval_id: approval.id }
+    });
+    return approval;
   }
 
-  return newLog;
+export async function listApprovalRequests(workspaceId: string = WS): Promise<ApprovalRequest[]> {
+    let requests = globalMemoryStore.approvals.filter((item) => item.workspace_id === workspaceId);
+    const supabase = await getSupabase();
+    if (supabase) {
+      const { data, error } = await supabase
+        .from("approvals")
+        .select("*")
+        .eq("workspace_id", workspaceId)
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(`Unable to load approval requests: ${error.message}`);
+      if (data) {
+        requests = data.map((item) => ({
+          id: item.id,
+          workspace_id: item.workspace_id,
+          action: item.tool,
+          args: item.args || {},
+          requested_by: item.requested_by || "marketer",
+          status: item.status,
+          reason: item.reason,
+          created_at: item.created_at
+        }));
+      }
+    }
+    return requests;
+  }
+
+export async function decideApprovalRequest(
+    approvalId: string,
+    approved: boolean,
+    decidedBy: string,
+    reason?: string,
+    workspaceId: string = WS
+  ): Promise<ApprovalRequest> {
+    const approval = (await listApprovalRequests(workspaceId)).find((item) => item.id === approvalId);
+    if (!approval) throw new Error("Approval request not found.");
+    if (approval.status !== "pending") throw new Error("This approval request has already been decided.");
+
+    if (approved) {
+      if (approval.action === "subscribe_contact") {
+        await subscribeContact(approval.args.contactId, approval.args.planId, workspaceId);
+      } else if (approval.action === "send_campaign") {
+        await sendCampaign(approval.args.campaignId, workspaceId);
+      }
+    }
+
+    approval.status = approved ? "approved" : "rejected";
+    approval.reason = reason?.trim() || undefined;
+    const supabase = await getSupabase();
+    if (supabase) {
+      const { error } = await supabase
+        .from("approvals")
+        .update({
+          status: approval.status,
+          reason: approval.reason || null,
+          decided_by: decidedBy,
+          decided_at: new Date().toISOString()
+        })
+        .eq("id", approvalId)
+        .eq("workspace_id", workspaceId)
+        .eq("status", "pending");
+      if (error) throw new Error(`Unable to save approval decision: ${error.message}`);
+    }
+    await createAuditLog({
+      workspace_id: workspaceId,
+      role: decidedBy,
+      tool: approved ? "approve_request" : "reject_request",
+      risk: "high",
+      status: approved ? "executed" : "rejected",
+      args: { approval_id: approvalId, reason: reason || "" },
+      result: { action: approval.action }
+    });
+    return approval;
 }
 
 export async function getAgentRun(runId: string): Promise<AgentRun | null> {
@@ -1194,7 +1913,7 @@ export async function saveAgentRun(run: AgentRun): Promise<void> {
     globalMemoryStore.agent_runs.unshift(run);
   }
 
-  const supabase = getSupabase();
+  const supabase = await getSupabase();
   if (supabase) {
     try {
       await supabase.from("agent_runs").upsert(run);

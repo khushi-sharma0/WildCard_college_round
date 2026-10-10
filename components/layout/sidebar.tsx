@@ -11,8 +11,11 @@ import {
   Mail,
   CreditCard,
   ShieldAlert,
+  ClipboardCheck,
+  UserCog,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { UserRole } from "@/lib/auth";
 
 const NAV_ITEMS = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -22,11 +25,14 @@ const NAV_ITEMS = [
   { href: "/webinars", label: "Webinars", icon: Video },
   { href: "/marketing", label: "Marketing", icon: Mail },
   { href: "/billing", label: "SaaS Billing", icon: CreditCard },
-  { href: "/audit", label: "Audit Log", icon: ShieldAlert },
+  { href: "/approvals", label: "Approvals", icon: ClipboardCheck, adminOnly: true },
+  { href: "/audit", label: "Audit Log", icon: ShieldAlert, adminOnly: true },
+  { href: "/team", label: "Team & Roles", icon: UserCog, adminOnly: true },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ role }: { role: UserRole }) {
   const pathname = usePathname();
+  const visibleItems = NAV_ITEMS.filter((item) => !item.adminOnly || role === "admin");
 
   return (
     <aside className="w-64 flex-shrink-0 border-r border-stone-300 bg-[#F5F2EB] flex flex-col h-screen sticky top-0">
@@ -53,7 +59,7 @@ export default function Sidebar() {
         <div className="px-3 pb-2 text-[10px] font-mono font-semibold uppercase tracking-widest text-stone-500">
           Core Workflows
         </div>
-        {NAV_ITEMS.map((item) => {
+        {visibleItems.map((item) => {
           const Icon = item.icon;
           const isActive = pathname === item.href;
 
@@ -97,7 +103,7 @@ export default function Sidebar() {
       <div className="p-4 border-t border-stone-300 bg-[#EFECE4]">
         <div className="border border-stone-300 bg-white p-2.5 shadow-[1px_1px_0px_0px_#D6D3D1]">
           <div className="text-[10px] font-mono uppercase tracking-wider text-stone-500">Workspace</div>
-          <div className="text-xs font-semibold text-stone-900 truncate">Default Retail Entity</div>
+          <div className="text-xs font-semibold text-stone-900 truncate">Nexus Workspace</div>
           <div className="text-[10px] font-mono text-stone-500 truncate pt-0.5">ID: 00000000-0001</div>
         </div>
       </div>

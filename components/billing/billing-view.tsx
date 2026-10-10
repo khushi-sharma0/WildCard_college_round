@@ -9,6 +9,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { formatCurrency, formatDate } from "@/lib/utils";
+import { notifyToast } from "@/lib/toast";
 
 export default function BillingView({
   initialPlans,
@@ -69,8 +70,10 @@ export default function BillingView({
       setName("");
       setPriceDollars("49");
       setDescription("");
+      notifyToast("success", "Billing plan created.");
     } catch (err: any) {
       setError(err.message);
+      notifyToast("error", err.message || "Failed to create billing plan.");
     } finally {
       setPlanLoading(false);
     }
@@ -95,6 +98,11 @@ export default function BillingView({
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to subscribe contact");
+      if (data.pendingApproval) {
+        setSubscribeTargetPlan(null);
+        notifyToast("success", "Subscription request sent to Admin for approval.");
+        return;
+      }
 
       const contact = contacts.find((c) => c.id === selectedContactId);
       const newSub: Subscription = {
@@ -105,8 +113,10 @@ export default function BillingView({
 
       setSubscriptions([newSub, ...subscriptions]);
       setSubscribeTargetPlan(null);
+      notifyToast("success", `Subscription created for ${contact?.name || "customer"}.`);
     } catch (err: any) {
       setError(err.message);
+      notifyToast("error", err.message || "Failed to create subscription.");
     } finally {
       setSubscribeLoading(false);
     }
@@ -167,6 +177,11 @@ export default function BillingView({
       <div>
         <h2 className="font-serif text-xl font-bold text-stone-900 mb-4">Configured Product Plans</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {plans.length === 0 && (
+            <p className="col-span-full border border-dashed border-stone-400 bg-white p-8 text-center text-sm text-stone-500">
+              No billing plans configured yet.
+            </p>
+          )}
           {plans.map((plan) => (
             <div
               key={plan.id}
@@ -194,7 +209,8 @@ export default function BillingView({
               <div className="pt-4 border-t border-stone-200">
                 <button
                   onClick={() => !isViewer && setSubscribeTargetPlan(plan)}
-                  disabled={isViewer}
+                  disabled={isViewer || contacts.length === 0}
+                  title={contacts.length === 0 ? "Add a CRM contact before subscribing." : isViewer ? "Read-only access" : undefined}
                   className={`w-full py-2.5 px-4 rounded-none font-mono text-xs font-bold uppercase tracking-wider transition-all shadow-[2px_2px_0px_0px_#1C1917] flex items-center justify-center gap-1.5 cursor-pointer ${
                     isViewer
                       ? "bg-stone-200 text-stone-500 cursor-not-allowed border border-stone-300 shadow-none"
@@ -352,6 +368,8 @@ export default function BillingView({
                 <input
                   type="text"
                   required
+                  minLength={2}
+                  maxLength={100}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="e.g. Retail Growth Pass"
@@ -368,6 +386,7 @@ export default function BillingView({
                     type="number"
                     required
                     min="1"
+                    step="0.01"
                     value={priceDollars}
                     onChange={(e) => setPriceDollars(e.target.value)}
                     className="w-full px-3 py-2 rounded-none bg-[#FAF8F5] border border-stone-300 text-stone-900 text-xs focus:outline-none focus:border-stone-900 font-mono"

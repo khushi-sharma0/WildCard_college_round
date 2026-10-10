@@ -1,11 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { subscribeContact } from "@/lib/services";
-import { getRole } from "@/lib/auth";
+import { createApprovalRequest, subscribeContact } from "@/lib/services";
+import { authorize, getRole, isUnauthenticatedError } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
   try {
     const role = await getRole();
-    if (role === "viewer") {
+    const canSubscribe = await authorize(
+      role,
+      role === "admin" ? "billing_subscribe" : "billing_request",
+      "create_subscription"
+    );
+    if (!canSubscribe) {
       return NextResponse.json(
         { error: "Policy Blocked: Viewer role cannot create subscriptions." },
         { status: 403 }
@@ -22,9 +27,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (role === "marketer") {
+      const approval = await createApprovalRequest(
+        "subscribe_contact",
+        { contactId, planId },
+        role
+      );
+      return NextResponse.json({ approval, pendingApproval: true }, { status: 202 });
+    }
+
     const sub = await subscribeContact(contactId, planId);
     return NextResponse.json(sub);
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: error.message }, { status: isUnauthenticatedError(error) ? 401 : 500 });
   }
 }
