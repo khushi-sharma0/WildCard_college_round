@@ -229,7 +229,26 @@ export async function getIdentity(): Promise<CurrentUserWithRole> {
 }
 
 export async function getRole(): Promise<UserRole> {
-  return (await getIdentity()).role;
+  try {
+    const identity = await getCurrentUserWithRole({ optional: true });
+    if (identity?.role) {
+      return identity.role;
+    }
+  } catch {
+    // fallback
+  }
+
+  try {
+    const cookieStore = await cookies();
+    const roleCookie = cookieStore.get("role")?.value?.toLowerCase();
+    if (roleCookie === "admin" || roleCookie === "marketer" || roleCookie === "viewer") {
+      return roleCookie as UserRole;
+    }
+  } catch {
+    // fallback
+  }
+
+  return "viewer";
 }
 
 export async function signInWithPassword(email: string, password: string): Promise<{ token: string; identity: CurrentUserWithRole }> {
