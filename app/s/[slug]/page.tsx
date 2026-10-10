@@ -13,8 +13,9 @@ function legacyBlocks(title: string, content: string): PageBlock[] {
   ];
 }
 
-export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
-  const { slug } = await params;
+export async function generateMetadata({ params }: { params: { slug: string } | Promise<{ slug: string }> }) {
+  const resolved = await Promise.resolve(params);
+  const slug = resolved?.slug;
   const page = (await listPages()).find((item) => item.slug === slug && item.is_published);
   return {
     title: page ? `${page.title} | Nexus` : "Landing Page",
@@ -22,8 +23,9 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
   };
 }
 
-export default async function PublicLandingPage({ params }: { params: Promise<{ slug: string }> }) {
-  const { slug } = await params;
+export default async function PublicLandingPage({ params }: { params: { slug: string } | Promise<{ slug: string }> }) {
+  const resolved = await Promise.resolve(params);
+  const slug = resolved?.slug;
   const [pages, webinars, plans] = await Promise.all([listPages(), listWebinars(), listPlans()]);
   const page = pages.find((item) => item.slug === slug && item.is_published);
   if (!page) notFound();

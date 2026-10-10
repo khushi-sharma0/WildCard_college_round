@@ -14,16 +14,23 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Password sign-in is disabled in Supabase mode." }, { status: 404 });
   }
   try {
-    const parsed = loginSchema.safeParse(await request.json());
-    if (!parsed.success) return NextResponse.json({ error: "Enter a valid email and password." }, { status: 400 });
+    const body = await request.json();
+    const parsed = loginSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json({ error: "Enter a valid email and password." }, { status: 400 });
+    }
     const { token, identity } = await signInWithPassword(parsed.data.email, parsed.data.password);
     const response = NextResponse.json({ success: true, name: identity.fullName, role: identity.role });
     response.cookies.set(LOCAL_SESSION_COOKIE, token, localSessionCookieOptions());
     return response;
   } catch (error) {
+    console.error("Login attempt error:", error);
     const status = isUnauthenticatedError(error) ? 401 : 500;
-    return NextResponse.json({
-      error: status === 401 ? "Email or password is incorrect." : "Unable to sign in. Please try again."
-    }, { status });
+    const message = isUnauthenticatedError(error)
+      ? "Email or password is incorrect."
+      : error instanceof Error
+        ? error.message
+        : "Unable to sign in. Please try again.";
+    return NextResponse.json({ error: message }, { status });
   }
 }
