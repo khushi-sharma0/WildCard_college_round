@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { tools, RiskTier } from "./tools";
 import {
   saveAgentRun,
@@ -12,21 +13,26 @@ import {
   listPlans,
   listSubscriptions,
   queryAnalytics,
+  createApprovalForRun,
+  decideApprovalRequest,
+  getApprovalByRunId,
+  ApprovalRecord,
   WS,
   AgentRun
 } from "../services";
-import { UserRole } from "../auth";
+import { UserRole, canPerformAction } from "../auth";
 import { GoogleGenAI } from "@google/genai";
 import { formatDate } from "../utils";
 
 export interface SnapshotData {
   run: AgentRun;
+  approval?: ApprovalRecord | null;
   planSteps: string[];
   timeline: Array<{
     id: string;
     tool: string;
     risk: RiskTier;
-    status: "executed" | "blocked" | "pending_approval" | "rejected" | "error";
+    status: "executed" | "blocked" | "pending_approval" | "approved" | "rejected" | "error";
     args: Record<string, any>;
     result: Record<string, any>;
     timestamp: string;
@@ -80,7 +86,10 @@ export async function snapshot(runId: string): Promise<SnapshotData> {
     throw new Error(`Agent run ${runId} not found`);
   }
 
-  const logs = await listAuditLogs(run.workspace_id);
+  const [logs, approval] = await Promise.all([
+    listAuditLogs(run.workspace_id),
+    getApprovalByRunId(runId)
+  ]);
   const runLogs = logs.filter((l) => l.run_id === runId);
 
   // Extract plan checklist steps from submit_plan audit log or run.steps
@@ -207,6 +216,7 @@ export async function snapshot(runId: string): Promise<SnapshotData> {
 
   return {
     run,
+    approval,
     planSteps,
     timeline,
     pendingApproval,
@@ -1364,6 +1374,7 @@ async function handleWorkflowIntent(
 
       run.updated_at = new Date().toISOString();
       await saveAgentRun(run);
+      await createApprovalForRun(run);
       return await snapshot(run.id);
     }
 
@@ -1542,55 +1553,103 @@ async function executeStep(
 }
 
 /**
- * Decide: Admin approves or rejects the pending high-risk tool
+ * Create Manual Approval Request: persist a review request without immediate tool execution
+ */
+export async function createManualApprovalRequest(
+  actionName: string,
+  description: string,
+  risk: RiskTier,
+  role: UserRole,
+  workspaceId: string = WS
+): Promise<SnapshotData> {
+  if (!canPerformAction(role, "write")) {
+    throw new Error("Permission denied: viewers cannot create approval requests.");
+  }
+  const cleanName = actionName.trim();
+  const cleanDescription = description.trim();
+  if (!cleanName || cleanName.length > 100 || !cleanDescription || cleanDescription.length > 1000) {
+    throw new Error("An action name and description within the allowed lengths are required.");
+  }
+  if (!["low", "medium", "high"].includes(risk)) {
+    throw new Error("A valid risk level is required.");
+  }
+
+  const now = new Date().toISOString();
+  const run: AgentRun = {
+    id: randomUUID(),
+    workspace_id: workspaceId,
+    prompt: cleanDescription,
+    status: "running",
+    steps: [],
+    pending_tool: {
+      tool: "manual_review",
+      args: { action_name: cleanName, description: cleanDescription },
+      risk,
+    },
+    final_text: null,
+    role,
+    created_at: now,
+    updated_at: now,
+  };
+  await saveAgentRun(run);
+  await createApprovalForRun(run);
+  return snapshot(run.id);
+}
+
+/**
+ * Decide: Admin or Marketer approves or rejects the pending high-risk tool
  */
 export async function decide(
   runId: string,
   approved: boolean,
   role: UserRole = "viewer"
 ): Promise<SnapshotData> {
-  const run = await getAgentRun(runId);
-  if (!run) throw new Error(`Run ${runId} not found`);
-
-  if (run.status !== "awaiting_approval" || !run.pending_tool) {
-    throw new Error(`Run is not currently awaiting approval (status: ${run.status})`);
+  if (role !== "marketer" && role !== "admin") {
+    throw new Error("Permission denied: Only Admin or Marketer can approve or reject actions.");
   }
 
-  // Strict permission rule: Only Admin can approve
-  if (role !== "admin") {
-    throw new Error("Permission denied: Only an Admin can approve high-risk actions.");
-  }
-
-  const { tool: toolName, args } = run.pending_tool;
+  const { run, approval } = await decideApprovalRequest(runId, role, approved);
+  const { tool: toolName, args } = { tool: approval.tool, args: approval.args };
 
   if (!approved) {
-    // Admin rejected
+    run.pending_tool = null;
+    run.final_text = `Request rejected by ${role}. '${toolName}' was not executed.`;
+    run.updated_at = new Date().toISOString();
+    await saveAgentRun(run);
+    return snapshot(runId);
+  }
+
+  if (toolName === "manual_review") {
+    run.pending_tool = null;
+    run.status = "approved";
+    run.final_text = "Request approved. No automated action was configured for this request.";
+    run.updated_at = new Date().toISOString();
+    await saveAgentRun(run);
+    return snapshot(runId);
+  }
+
+  const tool = tools[toolName];
+  if (!tool || !tool.allowedRoles.includes(role)) {
+    run.status = "failed";
+    run.final_text = `Approval was recorded, but the action '${toolName}' is no longer permitted for this role.`;
+    run.updated_at = new Date().toISOString();
+    await saveAgentRun(run);
     await createAuditLog({
       workspace_id: run.workspace_id,
       run_id: run.id,
       role,
       tool: toolName,
       risk: "high",
-      status: "rejected",
+      status: "error",
       args,
-      result: { message: "Campaign dispatch was rejected by Admin. The draft campaign remains saved without outbound transmission." }
+      result: { error: run.final_text }
     });
-
-    run.status = "rejected";
-    run.pending_tool = null;
-    run.final_text = `Outbound campaign broadcast was declined by Admin. The campaign remains safely preserved as a draft in Marketing Automation without sending any emails.`;
-    run.updated_at = new Date().toISOString();
-    await saveAgentRun(run);
-
-    return await snapshot(runId);
+    return snapshot(runId);
   }
-
-  // Admin approved: Execute the pending high-risk tool
-  const tool = tools[toolName];
-  if (!tool) throw new Error(`Pending tool ${toolName} not found`);
 
   try {
     const result = await tool.execute(args, { role, workspaceId: run.workspace_id });
+    if (result?.success === false) throw new Error(String(result.error || "The action did not complete successfully."));
 
     await createAuditLog({
       workspace_id: run.workspace_id,
@@ -1613,14 +1672,7 @@ export async function decide(
 
     run.status = "completed";
     run.pending_tool = null;
-    run.final_text = `### Outbound Email Campaign Dispatched!
-
-Admin authorization confirmed. The outbound marketing broadcast has been successfully processed:
-
-• **Recipients:** Delivered to **${result.sent_count || 20} contacts** in the target segment.
-• **Delivery Gateway:** Processed through **Mailtrap Sandbox** (safe staging mode; no live external inboxes affected).
-• **Registration Funnel:** Emails contain direct trackable registration links to \`/s/ai-in-retail-masterclass\`.
-• **Governance:** Authorized by Admin with full cryptographic audit trail.`;
+    run.final_text = `Action '${toolName}' executed successfully. ${result.sent_count ?? 0} recipients processed. ${result.note ?? ""}`.trim();
 
     run.updated_at = new Date().toISOString();
     await saveAgentRun(run);
@@ -1628,9 +1680,20 @@ Admin authorization confirmed. The outbound marketing broadcast has been success
     return await snapshot(runId);
   } catch (err: any) {
     run.status = "failed";
+    run.pending_tool = null;
     run.final_text = `Execution failed during approved tool execution: ${err.message}`;
     run.updated_at = new Date().toISOString();
     await saveAgentRun(run);
-    return await snapshot(runId);
+    await createAuditLog({
+      workspace_id: run.workspace_id,
+      run_id: run.id,
+      role,
+      tool: toolName,
+      risk: "high",
+      status: "error",
+      args,
+      result: { error: err.message }
+    });
+    return snapshot(runId);
   }
 }

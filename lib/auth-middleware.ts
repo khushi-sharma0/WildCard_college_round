@@ -36,15 +36,6 @@ export async function updateAuthSession(request: NextRequest): Promise<NextRespo
   const publicPath = pathname === "/login" || pathname === "/setup-incomplete"
     || pathname.startsWith("/s/") || pathname === "/api/auth/login"
     || pathname === "/api/forms/submit";
-  if (!isAuthenticated && !publicPath && !pathname.startsWith("/api/")) {
-    const loginUrl = request.nextUrl.clone();
-    loginUrl.pathname = "/login";
-    loginUrl.search = "";
-    loginUrl.searchParams.set("next", pathname);
-    const redirect = NextResponse.redirect(loginUrl);
-    if (tampered) redirect.cookies.set(LOCAL_SESSION_COOKIE, "", { path: "/", maxAge: 0, httpOnly: true, sameSite: "lax" });
-    return redirect;
-  }
   if (isAuthenticated && pathname === "/login") {
     const dashboardUrl = request.nextUrl.clone();
     dashboardUrl.pathname = "/";

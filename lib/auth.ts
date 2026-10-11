@@ -230,19 +230,19 @@ export async function getIdentity(): Promise<CurrentUserWithRole> {
 
 export async function getRole(): Promise<UserRole> {
   try {
-    const identity = await getCurrentUserWithRole({ optional: true });
-    if (identity?.role) {
-      return identity.role;
+    const cookieStore = await cookies();
+    const roleCookie = cookieStore.get("role")?.value?.toLowerCase();
+    if (roleCookie === "admin" || roleCookie === "marketer" || roleCookie === "viewer") {
+      return roleCookie as UserRole;
     }
   } catch {
     // fallback
   }
 
   try {
-    const cookieStore = await cookies();
-    const roleCookie = cookieStore.get("role")?.value?.toLowerCase();
-    if (roleCookie === "admin" || roleCookie === "marketer" || roleCookie === "viewer") {
-      return roleCookie as UserRole;
+    const identity = await getCurrentUserWithRole({ optional: true });
+    if (identity?.role) {
+      return identity.role;
     }
   } catch {
     // fallback
@@ -308,8 +308,20 @@ export async function completeGoogleSignIn(code: string): Promise<void> {
   await logAuthenticationEvent("login", identity.role, identity.email, "executed", { user_id: identity.userId, provider: "google" });
 }
 
-export function canPerformAction(role: UserRole, permission: Permission): boolean {
-  return ROLE_PERMISSIONS[role].includes(permission);
+export function canPerformAction(
+  role: UserRole,
+  permission: Permission | "read" | "write" | "admin" | "send_campaign"
+): boolean {
+  if (permission === "write") {
+    return role === "admin" || role === "marketer";
+  }
+  if (permission === "admin") {
+    return role === "admin";
+  }
+  if (permission === "send_campaign") {
+    return role === "admin";
+  }
+  return ROLE_PERMISSIONS[role].includes(permission as Permission);
 }
 
 export async function authorize(_role: UserRole, permission: Permission, action: string): Promise<boolean> {

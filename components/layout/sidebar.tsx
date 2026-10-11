@@ -10,6 +10,8 @@ import {
   Video,
   Mail,
   CreditCard,
+  BarChart3,
+  ShieldCheck,
   ShieldAlert,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -23,12 +25,14 @@ const NAV_ITEMS = [
   { href: "/webinars", label: "Webinars", icon: Video },
   { href: "/marketing", label: "Marketing", icon: Mail },
   { href: "/billing", label: "SaaS Billing", icon: CreditCard },
-  { href: "/audit", label: "Audit Log", icon: ShieldAlert, adminOnly: true },
+  { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/security", label: "Workflow Security", icon: ShieldCheck },
+  { href: "/audit", label: "Audit Log", icon: ShieldAlert },
 ];
 
 export default function Sidebar({ role }: { role?: UserRole }) {
   const pathname = usePathname();
-  const visibleItems = NAV_ITEMS.filter((item) => !item.adminOnly || !role || role === "admin");
+  const visibleItems = NAV_ITEMS.filter((item) => item.href !== "/security" || role !== "viewer");
 
   return (
     <aside className="w-64 flex-shrink-0 border-r border-stone-300 bg-[#F5F2EB] flex flex-col h-screen sticky top-0">
