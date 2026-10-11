@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import { randomUUID } from "node:crypto";
 import { SiteBuilderSettings, SiteTheme } from "@/lib/site-themes";
@@ -6,6 +6,26 @@ import { record_usage } from "./billing/limits";
 
 // Default workspace ID
 export const WS = process.env.DEMO_WORKSPACE_ID || "00000000-0000-0000-0000-000000000001";
+
+export function getBusinessId(workspaceId?: string): string {
+  const envBusiness = process.env.ANALYTICS_BUSINESS_ID?.trim();
+  if (workspaceId && /^[0-9a-f-]{36}$/i.test(workspaceId) && workspaceId !== WS) {
+    return workspaceId;
+  }
+  return envBusiness || workspaceId || WS;
+}
+
+export interface ApprovalRecord {
+  id: string;
+  workspace_id: string;
+  run_id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  status: "pending" | "approved" | "rejected";
+  decided_by?: string | null;
+  decided_at?: string | null;
+  created_at: string;
+}
 
 export interface Workspace {
   id: string;
@@ -166,7 +186,7 @@ export interface AuditLog {
   role: string;
   tool: string;
   risk: "low" | "medium" | "high";
-  status: "executed" | "blocked" | "pending_approval" | "rejected" | "error";
+  status: "executed" | "blocked" | "pending_approval" | "approved" | "rejected" | "error";
   args: Record<string, any>;
   result: Record<string, any>;
   created_at: string;
@@ -176,7 +196,7 @@ export interface AgentRun {
   id: string;
   workspace_id: string;
   prompt: string;
-  status: "running" | "awaiting_approval" | "completed" | "failed" | "rejected";
+  status: "running" | "awaiting_approval" | "approved" | "completed" | "blocked" | "failed" | "rejected";
   steps: any[];
   pending_tool?: {
     tool: string;
@@ -516,14 +536,26 @@ if (!globalMemoryStore.subscriptions.some((s) => s.workspace_id === "ws-1")) {
 }
 globalMemoryStore.approval_requests = globalMemoryStore.approval_requests || [];
 
-async function getSupabase(): Promise<SupabaseClient | null> {
-  if (process.env.AUTH_MODE !== "supabase") return null;
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+function isMissingTable(error: { code?: string; message: string }, table: string): boolean {
+  return error.code === "42P01" || error.code === "PGRST205" ||
+    new RegExp(`could not find the table ['\\"]?public\\.${table}['\\"]? in the schema cache`, "i").test(error.message);
+}
+
+function isMissingWorkspaceColumn(error: { code?: string; message: string }, table: string): boolean {
+  return (error.code === "42703" || error.code === "PGRST204") &&
+    new RegExp(`${table}\\.workspace_id|workspace_id.*${table}|column .*workspace_id.* does not exist`, "i").test(error.message);
+}
+
+export function isSupabaseConfigured(): boolean {
+  return getSupabase() !== null;
+}
+
+function getSupabase(): SupabaseClient | null {
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key || url.includes("your-project") || key.includes("your_service_role_key")) {
     return null;
   }
-  const { createClient } = await import("@supabase/supabase-js");
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false }
   });
@@ -573,13 +605,14 @@ export async function trackPageEvent(
 ): Promise<void> {
   const supabase = await getSupabase();
   if (supabase) {
-    const { error } = await supabase.from("events").insert({
-      workspace_id: workspaceId,
-      event_type: eventType,
-      payload
-    });
-    if (error) throw new Error(`Unable to record ${eventType}: ${error.message}`);
-    return;
+    try {
+      const { error } = await supabase.from("events").insert({
+        workspace_id: workspaceId,
+        event_type: eventType,
+        payload
+      });
+      if (!error) return;
+    } catch (e) {}
   }
 
   await track(eventType, payload, workspaceId);
@@ -591,12 +624,23 @@ export async function getPageEventCounts(
   const supabase = await getSupabase();
   let events: Array<{ event_type: string; payload: Record<string, unknown> }> = [];
   if (supabase) {
-    const { data, error } = await supabase.from("events")
-      .select("event_type,payload")
-      .eq("workspace_id", workspaceId)
-      .in("event_type", ["page_view", "form_submitted"]);
-    if (error) throw new Error(`Unable to load landing page activity: ${error.message}`);
-    events = (data || []) as typeof events;
+    try {
+      const { data, error } = await supabase.from("events")
+        .select("event_type,payload")
+        .eq("workspace_id", workspaceId)
+        .in("event_type", ["page_view", "form_submitted"]);
+      if (!error && data) {
+        events = data as typeof events;
+      } else {
+        events = globalMemoryStore.events
+          .filter((event) => event.workspace_id === workspaceId && (event.event_type === "page_view" || event.event_type === "form_submitted"))
+          .map(({ event_type, payload }) => ({ event_type, payload }));
+      }
+    } catch (e) {
+      events = globalMemoryStore.events
+        .filter((event) => event.workspace_id === workspaceId && (event.event_type === "page_view" || event.event_type === "form_submitted"))
+        .map(({ event_type, payload }) => ({ event_type, payload }));
+    }
   } else {
     events = globalMemoryStore.events
       .filter((event) => event.workspace_id === workspaceId && (event.event_type === "page_view" || event.event_type === "form_submitted"))
@@ -655,14 +699,17 @@ export async function queryAnalytics(workspaceId: string = WS, rangeDays = 14) {
   );
   const supabase = await getSupabase();
   if (supabase) {
-    const { data, error } = await supabase
-      .from("events")
-      .select("event_type,payload,created_at")
-      .eq("workspace_id", workspaceId)
-      .gte("created_at", fromDate.toISOString())
-      .order("created_at", { ascending: true });
-    if (error) throw new Error(`Unable to load analytics events: ${error.message}`);
-    if (data) events = data as typeof events;
+    try {
+      const { data, error } = await supabase
+        .from("events")
+        .select("event_type,payload,created_at")
+        .eq("workspace_id", workspaceId)
+        .gte("created_at", fromDate.toISOString())
+        .order("created_at", { ascending: true });
+      if (!error && data && data.length > 0) {
+        events = data as typeof events;
+      }
+    } catch (e) {}
   }
   const pageViews = events.filter((event) => event.event_type === "page_view").length;
   const visitorsToRegistrants = pageViews
@@ -1507,12 +1554,16 @@ export async function updateContact(
 }
 
 export async function listSegments(workspaceId: string = WS): Promise<Segment[]> {
-  const supabase = await getSupabase();
+  const supabase = getSupabase();
   if (supabase) {
-    try {
-      const { data, error } = await supabase.from("segments").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
-      if (!error && data && data.length > 0) return data;
-    } catch (e) {}
+    const { data, error } = await supabase.from("segments").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
+    if (error) {
+      if (isMissingTable(error, "segments") || isMissingWorkspaceColumn(error, "segments")) {
+        return globalMemoryStore.segments.filter((s) => s.workspace_id === workspaceId);
+      }
+      throw new Error(`Could not load segments: ${error.message}`);
+    }
+    return (data ?? []) as Segment[];
   }
   return globalMemoryStore.segments.filter((s) => s.workspace_id === workspaceId);
 }
@@ -1520,9 +1571,10 @@ export async function listSegments(workspaceId: string = WS): Promise<Segment[]>
 export async function listPages(workspaceId: string = WS): Promise<Page[]> {
   const supabase = await getSupabase();
   if (supabase) {
-    const { data, error } = await supabase.from("pages").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
-    if (error) throw new Error(`Unable to load landing pages: ${error.message}`);
-    return (data || []) as Page[];
+    try {
+      const { data, error } = await supabase.from("pages").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
+      if (!error && data) return data as Page[];
+    } catch (e) {}
   }
   return globalMemoryStore.pages.filter((p) => p.workspace_id === workspaceId);
 }
@@ -1530,9 +1582,10 @@ export async function listPages(workspaceId: string = WS): Promise<Page[]> {
 export async function getWorkspaceName(workspaceId: string = WS): Promise<string> {
   const supabase = await getSupabase();
   if (supabase) {
-    const { data, error } = await supabase.from("workspaces").select("name").eq("id", workspaceId).maybeSingle();
-    if (error) throw new Error(`Unable to load workspace name: ${error.message}`);
-    if (data?.name) return data.name;
+    try {
+      const { data, error } = await supabase.from("workspaces").select("name").eq("id", workspaceId).maybeSingle();
+      if (!error && data?.name) return data.name;
+    } catch (e) {}
   }
   return "Nexus Demo Workspace";
 }
@@ -1540,9 +1593,12 @@ export async function getWorkspaceName(workspaceId: string = WS): Promise<string
 export async function listSiteThemes(workspaceId: string = WS): Promise<SavedSiteTheme[]> {
   const supabase = await getSupabase();
   if (supabase) {
-    const { data, error } = await supabase.from("site_themes").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
-    if (error) throw new Error(`Unable to load saved themes: ${error.message}`);
-    return (data || []).map((row) => ({ ...row.theme_data, workspace_id: row.workspace_id, created_at: row.created_at })) as SavedSiteTheme[];
+    try {
+      const { data, error } = await supabase.from("site_themes").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
+      if (!error && data && data.length > 0) {
+        return data.map((row) => ({ ...row.theme_data, workspace_id: row.workspace_id, created_at: row.created_at })) as SavedSiteTheme[];
+      }
+    } catch (e) {}
   }
   return globalMemoryStore.site_themes.filter((theme) => theme.workspace_id === workspaceId);
 }
@@ -1551,13 +1607,15 @@ export async function saveSiteTheme(theme: SiteTheme, workspaceId: string = WS):
   const supabase = await getSupabase();
   const saved: SavedSiteTheme = { ...theme, id: randomUUID(), name: "My Theme", workspace_id: workspaceId, created_at: new Date().toISOString() };
   if (supabase) {
-    const { data, error } = await supabase.from("site_themes")
-      .upsert({ workspace_id: workspaceId, name: "My Theme", theme_data: theme }, { onConflict: "workspace_id,name" })
-      .select()
-      .single();
-    if (error) throw new Error(`Unable to save theme: ${error.message}`);
-    if (!data) throw new Error("Unable to save theme: the database returned no record.");
-    return { ...data.theme_data, workspace_id: data.workspace_id, created_at: data.created_at } as SavedSiteTheme;
+    try {
+      const { data, error } = await supabase.from("site_themes")
+        .upsert({ workspace_id: workspaceId, name: "My Theme", theme_data: theme }, { onConflict: "workspace_id,name" })
+        .select()
+        .single();
+      if (!error && data) {
+        return { ...data.theme_data, workspace_id: data.workspace_id, created_at: data.created_at } as SavedSiteTheme;
+      }
+    } catch (e) {}
   }
   const index = globalMemoryStore.site_themes.findIndex((item) => item.workspace_id === workspaceId && item.name === "My Theme");
   if (index >= 0) globalMemoryStore.site_themes[index] = saved;
@@ -1589,14 +1647,15 @@ export async function listRegistrations(webinarId: string, workspaceId: string =
   let regs = globalMemoryStore.registrations.filter((r) => r.webinar_id === webinarId && r.workspace_id === workspaceId);
   const supabase = await getSupabase();
   if (supabase) {
-    const { data, error } = await supabase
-      .from("registrations")
-      .select("*")
-      .eq("workspace_id", workspaceId)
-      .eq("webinar_id", webinarId)
-      .order("created_at", { ascending: false });
-    if (error) throw new Error(`Unable to load webinar registrations: ${error.message}`);
-    if (data) regs = data;
+    try {
+      const { data, error } = await supabase
+        .from("registrations")
+        .select("*")
+        .eq("workspace_id", workspaceId)
+        .eq("webinar_id", webinarId)
+        .order("created_at", { ascending: false });
+      if (!error && data && data.length > 0) regs = data;
+    } catch (e) {}
   }
   const contacts = await listContacts(workspaceId);
   return regs.map((r) => ({
@@ -2046,19 +2105,42 @@ export async function listAuditLogs(
   status?: string,
   risk?: string
 ): Promise<AuditLog[]> {
-  let logs = globalMemoryStore.audit_logs.filter((a) => a.workspace_id === workspaceId);
-
-  const supabase = await getSupabase();
+  const supabase = getSupabase();
   if (supabase) {
-    try {
-      let q = supabase.from("audit_logs").select("*").eq("workspace_id", workspaceId).order("created_at", { ascending: false });
-      if (status && status !== "all") q = q.eq("status", status);
-      if (risk && risk !== "all") q = q.eq("risk", risk);
-      const { data, error } = await q;
-      if (!error && data && data.length > 0) return data;
-    } catch (e) {}
+    const businessId = getBusinessId(workspaceId);
+
+    // Read from analytics_events table where event_type = 'audit_log'
+    const { data: eventData, error: eventErr } = await supabase
+      .from("analytics_events")
+      .select("*")
+      .eq("business_id", businessId)
+      .eq("event_type", "audit_log")
+      .order("created_at", { ascending: false });
+
+    if (!eventErr && eventData) {
+      let logs: AuditLog[] = eventData.map((e) => {
+        const details = (e.event_data as Record<string, any>) || {};
+        return {
+          id: e.id,
+          workspace_id: workspaceId,
+          run_id: details.run_id,
+          role: details.role || "viewer",
+          tool: details.tool || "security_event",
+          risk: (details.risk as AuditLog["risk"]) || "low",
+          status: (details.status as AuditLog["status"]) || "executed",
+          args: details.args || {},
+          result: details.result || {},
+          created_at: e.created_at,
+        };
+      });
+
+      if (status && status !== "all") logs = logs.filter((l) => l.status === status);
+      if (risk && risk !== "all") logs = logs.filter((l) => l.risk === risk);
+      return logs;
+    }
   }
 
+  let logs = globalMemoryStore.audit_logs.filter((a) => a.workspace_id === workspaceId);
   if (status && status !== "all") logs = logs.filter((l) => l.status === status);
   if (risk && risk !== "all") logs = logs.filter((l) => l.risk === risk);
   return logs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -2067,168 +2149,497 @@ export async function listAuditLogs(
 export async function createAuditLog(
   log: Omit<AuditLog, "id" | "created_at">
 ): Promise<AuditLog> {
-  const { getOptionalIdentity } = await import("@/lib/auth");
-  const identity = await getOptionalIdentity();
-  const newLog: AuditLog = {
-    id: randomUUID(),
-    ...log,
-    args: identity
-      ? {
-          ...log.args,
-          actor_id: identity.userId,
-          actor_email: identity.email,
-          real_role: identity.realRole,
-          effective_role: identity.role,
-          impersonating: identity.isImpersonating
-        }
-      : log.args,
-    created_at: new Date().toISOString()
-  };
-  globalMemoryStore.audit_logs.unshift(newLog);
-
-  const supabase = await getSupabase();
+  const supabase = getSupabase();
   if (supabase) {
-    const { error } = await supabase.from("audit_logs").insert(newLog);
-    if (error) throw new Error(`Unable to persist audit log: ${error.message}`);
+    const businessId = getBusinessId(log.workspace_id);
+    try {
+      const { data, error } = await supabase
+        .from("analytics_events")
+        .insert({
+          business_id: businessId,
+          event_type: "audit_log",
+          event_data: {
+            run_id: log.run_id,
+            role: log.role,
+            tool: log.tool,
+            risk: log.risk,
+            status: log.status,
+            args: log.args,
+            result: log.result,
+          },
+        })
+        .select("*")
+        .single();
+
+      if (!error && data) {
+        const created: AuditLog = {
+          id: data.id,
+          workspace_id: log.workspace_id,
+          run_id: log.run_id,
+          role: log.role,
+          tool: log.tool,
+          risk: log.risk,
+          status: log.status,
+          args: log.args,
+          result: log.result,
+          created_at: data.created_at,
+        };
+        globalMemoryStore.audit_logs.unshift(created);
+        return created;
+      } else if (error) {
+        console.warn("Could not save audit record to analytics_events:", error.message);
+      }
+    } catch (e) {
+      console.warn("Error inserting audit record to analytics_events:", e);
+    }
   }
+
+  const newLog: AuditLog = { id: randomUUID(), ...log, created_at: new Date().toISOString() };
+  globalMemoryStore.audit_logs.unshift(newLog);
   return newLog;
 }
 
-export async function createApprovalRequest(
-  action: string,
-  argsOrRequester: any,
-  requestedByOrArgs?: any,
-  workspaceId: string = WS
-): Promise<ApprovalRequest> {
-  let finalArgs: Record<string, any> = {};
-  let finalRequester = "admin@nexus.internal";
+export async function createApprovalForRun(run: AgentRun): Promise<ApprovalRecord> {
+  if (!run.pending_tool) throw new Error("An approval request must include a pending tool action.");
+  const supabase = getSupabase();
+  if (supabase) {
+    const businessId = getBusinessId(run.workspace_id);
+    const actionName = (run.pending_tool.args?.action_name as string) || run.pending_tool.tool;
+    const now = new Date().toISOString();
 
-  if (typeof argsOrRequester === "string") {
-    finalRequester = argsOrRequester;
-    finalArgs = requestedByOrArgs || {};
-  } else {
-    finalArgs = argsOrRequester || {};
-    finalRequester = typeof requestedByOrArgs === "string" ? requestedByOrArgs : "admin@nexus.internal";
-  }
+    const { data, error } = await supabase
+      .from("workflow_approvals")
+      .upsert(
+        {
+          id: run.id,
+          business_id: businessId,
+          action: actionName,
+          details: {
+            run_id: run.id,
+            prompt: run.prompt,
+            description: (run.pending_tool.args?.description as string) || run.prompt,
+            risk: run.pending_tool.risk || "medium",
+            role: run.role,
+            tool: run.pending_tool.tool,
+            args: run.pending_tool.args || {},
+            steps: run.steps || [],
+            final_text: run.final_text || null,
+            decided_by: null,
+            decided_at: null,
+            result: null,
+            created_at: run.created_at || now,
+            updated_at: run.updated_at || now,
+          },
+          status: "pending",
+        },
+        { onConflict: "id" }
+      )
+      .select("*")
+      .single();
 
-  const idempotencyKey = `${action}:${Object.values(finalArgs).join(":")}:${finalRequester}`;
-  const existing = globalMemoryStore.approvals.find(
-    (item) =>
-      item.workspace_id === workspaceId &&
-      item.status === "pending" &&
-      `${item.action}:${Object.values(item.args).join(":")}:${item.requested_by}` === idempotencyKey
-  );
-  if (existing) return existing;
-
-  const approval: ApprovalRequest = {
-    id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    workspace_id: workspaceId,
-    action,
-    args: finalArgs,
-    requested_by: finalRequester,
-    status: "pending",
-    created_at: new Date().toISOString()
-  };
-    globalMemoryStore.approvals.unshift(approval);
-    const supabase = await getSupabase();
-    if (supabase) {
-      const { error } = await supabase.from("approvals").insert({
-        id: approval.id,
-        workspace_id: workspaceId,
-        tool: action,
-        args: finalArgs,
-        requested_by: finalRequester,
-        status: "pending"
-      });
-      if (error) throw new Error(`Unable to save approval request: ${error.message}`);
+    if (error) {
+      console.error("Could not insert approval into workflow_approvals:", error.message);
+      throw new Error(`Could not create approval request in Supabase: ${error.message}`);
     }
+
+    run.status = "awaiting_approval";
+    run.updated_at = now;
+
+    // Record audit event
     await createAuditLog({
-      workspace_id: workspaceId,
-      role: finalRequester,
-      tool: `request_${action}`,
-      risk: "high",
+      workspace_id: run.workspace_id,
+      run_id: run.id,
+      role: run.role,
+      tool: run.pending_tool.tool,
+      risk: run.pending_tool.risk as AuditLog["risk"],
       status: "pending_approval",
-      args: finalArgs,
-      result: { approval_id: approval.id }
+      args: run.pending_tool.args,
+      result: { message: "Approval request created." },
     });
+
+    const approval: ApprovalRecord = {
+      id: data.id,
+      workspace_id: run.workspace_id,
+      run_id: data.id,
+      tool: run.pending_tool.tool,
+      args: run.pending_tool.args || {},
+      status: "pending",
+      created_at: data.created_at,
+    };
+
+    const aIdx = (globalMemoryStore.approvals as any[]).findIndex((a) => (a.run_id || a.id) === run.id);
+    if (aIdx >= 0) (globalMemoryStore.approvals as any[])[aIdx] = approval;
+    else (globalMemoryStore.approvals as any[]).unshift(approval);
+
+    const rIdx = globalMemoryStore.agent_runs.findIndex((r) => r.id === run.id);
+    if (rIdx >= 0) globalMemoryStore.agent_runs[rIdx] = run;
+    else globalMemoryStore.agent_runs.unshift(run);
+
     return approval;
   }
 
-export async function listApprovalRequests(workspaceId: string = WS): Promise<ApprovalRequest[]> {
-    let requests = globalMemoryStore.approvals.filter((item) => item.workspace_id === workspaceId);
-    const supabase = await getSupabase();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from("approvals")
-        .select("*")
-        .eq("workspace_id", workspaceId)
-        .order("created_at", { ascending: false });
-      if (error) throw new Error(`Unable to load approval requests: ${error.message}`);
-      if (data) {
-        requests = data.map((item) => ({
-          id: item.id,
-          workspace_id: item.workspace_id,
-          action: item.tool,
-          args: item.args || {},
-          requested_by: item.requested_by || "marketer",
-          status: item.status,
-          reason: item.reason,
-          created_at: item.created_at
-        }));
-      }
-    }
-    return requests;
-  }
+  const now = new Date().toISOString();
+  const approval: ApprovalRecord = {
+    id: run.id,
+    workspace_id: run.workspace_id,
+    run_id: run.id,
+    tool: run.pending_tool.tool,
+    args: run.pending_tool.args,
+    status: "pending",
+    created_at: now,
+  };
+  run.status = "awaiting_approval";
+  run.updated_at = now;
+  (globalMemoryStore.approvals as any[]).unshift(approval);
+  await saveAgentRun(run);
+  await createAuditLog({
+    workspace_id: run.workspace_id,
+    run_id: run.id,
+    role: run.role,
+    tool: run.pending_tool.tool,
+    risk: run.pending_tool.risk as AuditLog["risk"],
+    status: "pending_approval",
+    args: run.pending_tool.args,
+    result: { message: "Approval request created." },
+  });
+  return approval;
+}
 
 export async function decideApprovalRequest(
-    approvalId: string,
-    approved: boolean,
-    decidedBy: string,
-    reason?: string,
-    workspaceId: string = WS
-  ): Promise<ApprovalRequest> {
-    const approval = (await listApprovalRequests(workspaceId)).find((item) => item.id === approvalId);
-    if (!approval) throw new Error("Approval request not found.");
-    if (approval.status !== "pending") throw new Error("This approval request has already been decided.");
+  runId: string,
+  roleOrApproved: string | boolean,
+  approvedOrRole: boolean | string
+): Promise<{ run: AgentRun; approval: ApprovalRecord }> {
+  const role = typeof roleOrApproved === "string" ? roleOrApproved : String(approvedOrRole);
+  const approved = typeof approvedOrRole === "boolean" ? approvedOrRole : Boolean(roleOrApproved);
 
-    if (approved) {
-      if (approval.action === "subscribe_contact") {
-        await subscribeContact(approval.args.contactId, approval.args.planId, workspaceId);
-      } else if (approval.action === "send_campaign") {
-        await sendCampaign(approval.args.campaignId, workspaceId);
-      }
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data: current, error: fetchErr } = await supabase
+      .from("workflow_approvals")
+      .select("*")
+      .eq("id", runId)
+      .maybeSingle();
+
+    if (fetchErr || !current) {
+      throw new Error(`Approval request with ID ${runId} was not found.`);
     }
 
-    approval.status = approved ? "approved" : "rejected";
-    approval.reason = reason?.trim() || undefined;
-    const supabase = await getSupabase();
-    if (supabase) {
-      const { error } = await supabase
-        .from("approvals")
-        .update({
-          status: approval.status,
-          reason: approval.reason || null,
-          decided_by: decidedBy,
-          decided_at: new Date().toISOString()
-        })
-        .eq("id", approvalId)
-        .eq("workspace_id", workspaceId)
-        .eq("status", "pending");
-      if (error) throw new Error(`Unable to save approval decision: ${error.message}`);
+    const currentStatus = String(current.status || "").toLowerCase();
+    if (currentStatus !== "pending") {
+      throw new Error(
+        `Approval request has already been decided (current status: ${current.status}).`
+      );
     }
+
+    const now = new Date().toISOString();
+    const newStatus = approved ? "approved" : "rejected";
+    const currentDetails = (current.details as Record<string, any>) || {};
+    const toolName = currentDetails.tool || current.action;
+    const toolRisk = (currentDetails.risk as AuditLog["risk"]) || "high";
+    const toolArgs = currentDetails.args || {};
+
+    const updatedDetails: Record<string, any> = {
+      ...currentDetails,
+      decided_by: role,
+      decided_at: now,
+      updated_at: now,
+      final_text: approved
+        ? `Request approved by ${role}.`
+        : `Request rejected by ${role}; action was not executed.`,
+      result: {
+        message: approved
+          ? `Approved by ${role}; execution started.`
+          : `Rejected by ${role}; action was not executed.`,
+      },
+    };
+
+    // Safe conditional update to prevent race conditions or duplicate decisions
+    const { data: updated, error: updateErr } = await supabase
+      .from("workflow_approvals")
+      .update({
+        status: newStatus,
+        details: updatedDetails,
+      })
+      .eq("id", runId)
+      .eq("status", current.status)
+      .select("*")
+      .single();
+
+    if (updateErr || !updated) {
+      throw new Error(
+        "Could not update approval request; it may have been decided concurrently by another operator."
+      );
+    }
+
+    // Record audit event in Supabase
     await createAuditLog({
-      workspace_id: workspaceId,
-      role: decidedBy,
-      tool: approved ? "approve_request" : "reject_request",
-      risk: "high",
-      status: approved ? "executed" : "rejected",
-      args: { approval_id: approvalId, reason: reason || "" },
-      result: { action: approval.action }
+      workspace_id: WS,
+      run_id: runId,
+      role,
+      tool: toolName,
+      risk: toolRisk,
+      status: approved ? "approved" : "rejected",
+      args: toolArgs,
+      result: {
+        message: approved
+          ? `Approved by ${role}; execution started.`
+          : `Rejected by ${role}; action was not executed.`,
+      },
     });
-    return approval;
+
+    const run: AgentRun = {
+      id: updated.id,
+      workspace_id: WS,
+      prompt: updatedDetails.prompt || updatedDetails.description || updated.action,
+      status: approved ? "approved" : "rejected",
+      steps: updatedDetails.steps || [],
+      pending_tool: approved ? { tool: toolName, args: toolArgs, risk: toolRisk } : null,
+      final_text: updatedDetails.final_text || null,
+      role: updatedDetails.role || "viewer",
+      created_at: updated.created_at,
+      updated_at: now,
+    };
+
+    const approval: ApprovalRecord = {
+      id: updated.id,
+      workspace_id: WS,
+      run_id: updated.id,
+      tool: toolName,
+      args: toolArgs,
+      status: approved ? "approved" : "rejected",
+      decided_by: role,
+      decided_at: now,
+      created_at: updated.created_at,
+    };
+
+    const aIdx = (globalMemoryStore.approvals as any[]).findIndex((a) => (a.run_id || a.id) === runId);
+    if (aIdx >= 0) (globalMemoryStore.approvals as any[])[aIdx] = approval;
+    else (globalMemoryStore.approvals as any[]).unshift(approval);
+
+    const rIdx = globalMemoryStore.agent_runs.findIndex((r) => r.id === runId);
+    if (rIdx >= 0) globalMemoryStore.agent_runs[rIdx] = run;
+    else globalMemoryStore.agent_runs.unshift(run);
+
+    return { run, approval };
+  }
+
+  const approval = (globalMemoryStore.approvals as any[]).find((item) => (item.run_id || item.id) === runId);
+  const run = globalMemoryStore.agent_runs.find((item) => item.id === runId);
+  if (!approval || !run || approval.status !== "pending" || run.status !== "awaiting_approval") {
+    throw new Error("Approval is missing or has already been decided.");
+  }
+  const now = new Date().toISOString();
+  approval.status = approved ? "approved" : "rejected";
+  approval.decided_by = role;
+  approval.decided_at = now;
+  run.status = approved ? "approved" : "rejected";
+  if (!approved) run.pending_tool = null;
+  run.updated_at = now;
+  await createAuditLog({
+    workspace_id: run.workspace_id,
+    run_id: run.id,
+    role,
+    tool: approval.tool || approval.action,
+    risk: "high",
+    status: approved ? "approved" : "rejected",
+    args: approval.args,
+    result: {
+      message: approved
+        ? "Approval recorded; action execution started."
+        : "Request rejected; action was not executed.",
+    },
+  });
+  return { run, approval };
+}
+
+export async function listApprovals(workspaceId: string = WS): Promise<ApprovalRecord[]> {
+  const supabase = getSupabase();
+  if (supabase) {
+    const businessId = getBusinessId(workspaceId);
+    const { data, error } = await supabase
+      .from("workflow_approvals")
+      .select("*")
+      .eq("business_id", businessId)
+      .order("created_at", { ascending: false });
+
+    if (!error && data) {
+      return data.map((row) => {
+        const s = String(row.status || "").toLowerCase();
+        const statusVal: ApprovalRecord["status"] =
+          s === "pending" ? "pending" : s === "rejected" ? "rejected" : "approved";
+        const details = (row.details as Record<string, any>) || {};
+
+        return {
+          id: row.id,
+          workspace_id: workspaceId,
+          run_id: details.run_id || row.id,
+          tool: details.tool || row.action,
+          args: (details.args as Record<string, unknown>) || {
+            action_name: row.action,
+            description: details.description || "",
+          },
+          status: statusVal,
+          decided_by: details.decided_by || null,
+          decided_at: details.decided_at || null,
+          created_at: row.created_at,
+        };
+      });
+    }
+  }
+
+  return (globalMemoryStore.approvals as any[])
+    .filter((approval) => approval.workspace_id === workspaceId)
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+}
+
+export async function getApprovalByRunId(runId: string): Promise<ApprovalRecord | null> {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data: row, error } = await supabase
+      .from("workflow_approvals")
+      .select("*")
+      .eq("id", runId)
+      .maybeSingle();
+
+    if (!error && row) {
+      const s = String(row.status || "").toLowerCase();
+      const statusVal: ApprovalRecord["status"] =
+        s === "pending" ? "pending" : s === "rejected" ? "rejected" : "approved";
+      const details = (row.details as Record<string, any>) || {};
+
+      return {
+        id: row.id,
+        workspace_id: WS,
+        run_id: details.run_id || row.id,
+        tool: details.tool || row.action,
+        args: (details.args as Record<string, unknown>) || {
+          action_name: row.action,
+          description: details.description || "",
+        },
+        status: statusVal,
+        decided_by: details.decided_by || null,
+        decided_at: details.decided_at || null,
+        created_at: row.created_at,
+      };
+    }
+  }
+
+  return (globalMemoryStore.approvals as any[]).find((a) => (a.run_id || a.id) === runId) || null;
+}
+
+export async function listAgentRuns(workspaceId: string = WS): Promise<AgentRun[]> {
+  const supabase = getSupabase();
+  if (supabase) {
+    const businessId = getBusinessId(workspaceId);
+    const { data, error } = await supabase
+      .from("workflow_approvals")
+      .select("*")
+      .eq("business_id", businessId)
+      .order("created_at", { ascending: false });
+
+    if (!error && data) {
+      return data.map((row) => {
+        const s = String(row.status || "").toLowerCase();
+        const runStatus: AgentRun["status"] =
+          s === "pending"
+            ? "awaiting_approval"
+            : s === "approved"
+            ? "approved"
+            : s === "rejected"
+            ? "rejected"
+            : s === "executed" || s === "completed"
+            ? "completed"
+            : s === "failed"
+            ? "failed"
+            : s === "blocked"
+            ? "blocked"
+            : "running";
+
+        const details = (row.details as Record<string, any>) || {};
+        const toolName = details.tool || row.action;
+        const toolArgs = details.args || {
+          action_name: row.action,
+          description: details.description || "",
+        };
+        const toolRisk = details.risk || "medium";
+
+        return {
+          id: details.run_id || row.id,
+          workspace_id: workspaceId,
+          prompt: details.prompt || details.description || row.action,
+          status: runStatus,
+          steps: details.steps || [],
+          pending_tool:
+            s === "pending"
+              ? { tool: toolName, args: toolArgs, risk: toolRisk }
+              : null,
+          final_text: details.final_text || null,
+          role: details.role || "viewer",
+          created_at: row.created_at,
+          updated_at: details.updated_at || row.created_at,
+        };
+      });
+    }
+  }
+
+  return globalMemoryStore.agent_runs
+    .filter((run) => run.workspace_id === workspaceId)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 }
 
 export async function getAgentRun(runId: string): Promise<AgentRun | null> {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data: row, error } = await supabase
+      .from("workflow_approvals")
+      .select("*")
+      .eq("id", runId)
+      .maybeSingle();
+
+    if (!error && row) {
+      const s = String(row.status || "").toLowerCase();
+      const runStatus: AgentRun["status"] =
+        s === "pending"
+          ? "awaiting_approval"
+          : s === "approved"
+          ? "approved"
+          : s === "rejected"
+          ? "rejected"
+          : s === "executed" || s === "completed"
+            ? "completed"
+            : s === "failed"
+            ? "failed"
+            : s === "blocked"
+            ? "blocked"
+            : "running";
+
+      const details = (row.details as Record<string, any>) || {};
+      const toolName = details.tool || row.action;
+      const toolArgs = details.args || {
+        action_name: row.action,
+        description: details.description || "",
+      };
+      const toolRisk = details.risk || "medium";
+
+      return {
+        id: details.run_id || row.id,
+        workspace_id: WS,
+        prompt: details.prompt || details.description || row.action,
+        status: runStatus,
+        steps: details.steps || [],
+        pending_tool:
+          s === "pending"
+            ? { tool: toolName, args: toolArgs, risk: toolRisk }
+            : null,
+        final_text: details.final_text || null,
+        role: details.role || "viewer",
+        created_at: row.created_at,
+        updated_at: details.updated_at || row.created_at,
+      };
+    }
+  }
+
   const run = globalMemoryStore.agent_runs.find((r) => r.id === runId);
   return run || null;
 }
@@ -2241,10 +2652,83 @@ export async function saveAgentRun(run: AgentRun): Promise<void> {
     globalMemoryStore.agent_runs.unshift(run);
   }
 
-  const supabase = await getSupabase();
+  const supabase = getSupabase();
   if (supabase) {
+    const businessId = getBusinessId(run.workspace_id);
+    const actionName =
+      (run.pending_tool?.args?.action_name as string) ||
+      run.pending_tool?.tool ||
+      "agent_workflow";
+    const statusDb =
+      run.status === "awaiting_approval"
+        ? "pending"
+        : run.status === "completed"
+        ? "completed"
+        : run.status === "approved"
+        ? "approved"
+        : run.status === "rejected"
+        ? "rejected"
+        : run.status === "failed"
+        ? "failed"
+        : run.status === "blocked"
+        ? "blocked"
+        : "running";
+
     try {
-      await supabase.from("agent_runs").upsert(run);
-    } catch (e) {}
+      await supabase.from("workflow_approvals").upsert({
+        id: run.id,
+        business_id: businessId,
+        action: actionName,
+        details: {
+          run_id: run.id,
+          prompt: run.prompt,
+          description: (run.pending_tool?.args?.description as string) || run.prompt,
+          risk: run.pending_tool?.risk || "medium",
+          role: run.role,
+          tool: run.pending_tool?.tool || actionName,
+          args: run.pending_tool?.args || {},
+          steps: run.steps || [],
+          final_text: run.final_text || null,
+          updated_at: run.updated_at || new Date().toISOString(),
+        },
+        status: statusDb,
+      });
+    } catch (e) {
+      console.warn("Could not upsert run to workflow_approvals:", e);
+    }
   }
+}
+
+export async function createApprovalRequest(
+  action: string,
+  argsOrRequester: any,
+  requestedByOrArgs?: any,
+  workspaceId: string = WS
+): Promise<any> {
+  let finalArgs: Record<string, any> = {};
+  let finalRequester = "admin@nexus.internal";
+
+  if (typeof argsOrRequester === "string") {
+    finalRequester = argsOrRequester;
+    finalArgs = requestedByOrArgs || {};
+  } else {
+    finalArgs = argsOrRequester || {};
+    finalRequester = typeof requestedByOrArgs === "string" ? requestedByOrArgs : "admin@nexus.internal";
+  }
+
+  const approval = {
+    id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    workspace_id: workspaceId,
+    action,
+    args: finalArgs,
+    requested_by: finalRequester,
+    status: "pending",
+    created_at: new Date().toISOString()
+  };
+  (globalMemoryStore.approvals as any[]).unshift(approval);
+  return approval;
+}
+
+export async function listApprovalRequests(workspaceId: string = WS): Promise<any[]> {
+  return (globalMemoryStore.approvals as any[]).filter((item) => item.workspace_id === workspaceId);
 }
